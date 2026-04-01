@@ -213,14 +213,33 @@ class ApiGui:
         main_paned.add(left_frame, weight=1)
 
         ttk.Label(left_frame, text="搜索接口 (双击定位文件):").pack(anchor="w")
+        
+        search_frame = ttk.Frame(left_frame)
+        search_frame.pack(fill="x", pady=2)
+        
         self.search_var = tk.StringVar()
         self.search_var.trace("w", self.filter_apis)
-        ttk.Entry(left_frame, textvariable=self.search_var).pack(fill="x", pady=2)
+        ttk.Entry(search_frame, textvariable=self.search_var).pack(side="left", fill="x", expand=True)
+        
+        # 批量勾选操作按钮
+        check_btn_frame = ttk.Frame(left_frame)
+        check_btn_frame.pack(fill="x")
+        ttk.Button(check_btn_frame, text="全选当前", command=self.select_all_visible, width=10).pack(side="left", padx=2)
+        ttk.Button(check_btn_frame, text="清空所有", command=self.clear_all_selected, width=10).pack(side="left", padx=2)
 
-        self.api_listbox = tk.Listbox(left_frame, font=("Consolas", 10), exportselection=False, selectmode=tk.EXTENDED)
-        self.api_listbox.pack(fill="both", expand=True)
-        self.api_listbox.bind("<<ListboxSelect>>", self.on_api_select)
-        self.api_listbox.bind("<Double-Button-1>", self.on_api_double_click)
+        # 使用 Treeview 替代 Listbox 以支持勾选框列
+        self.api_tree = ttk.Treeview(left_frame, columns=("check", "name"), show="headings", selectmode="browse")
+        self.api_tree.heading("check", text="√", anchor="center")
+        self.api_tree.heading("name", text="接口名称", anchor="w")
+        self.api_tree.column("check", width=35, stretch=False, anchor="center")
+        self.api_tree.column("name", width=200, stretch=True)
+        self.api_tree.pack(fill="both", expand=True)
+        
+        self.api_tree.bind("<Button-1>", self.on_tree_click)
+        self.api_tree.bind("<Double-Button-1>", self.on_api_double_click)
+        
+        # 用于记录跨搜索持久化的勾选状态
+        self.selected_apis = set()
         
         right_frame = ttk.Frame(main_paned)
         main_paned.add(right_frame, weight=3)
@@ -251,26 +270,57 @@ class ApiGui:
         self.res_text.tag_config("bold", font=("Consolas", 11, "bold"))
 
         self.all_apis = sorted(list(self.client.apis.keys()))
+        self.visible_apis = [] # 当前搜索可见的接口列表
         self.filter_apis()
 
     def filter_apis(self, *args):
         search_term = self.search_var.get().lower()
-        self.api_listbox.delete(0, tk.END)
+        # 清空当前视图
+        for item in self.api_tree.get_children():
+            self.api_tree.delete(item)
+        
+        self.visible_apis = []
         for api in self.all_apis:
             if search_term in api.lower():
-                self.api_listbox.insert(tk.END, api)
+                self.visible_apis.append(api)
+                status = "☑" if api in self.selected_apis else "☐"
+                self.api_tree.insert("", "end", iid=api, values=(status, api))
 
-    def on_api_select(self, event):
-        selection = self.api_listbox.curselection()
-        if not selection: return
-        api_name = self.api_listbox.get(selection[-1])
+    def on_tree_click(self, event):
+        """处理 Treeview 点击事件：点击勾选框列则切换状态，点击名称列则显示参数"""
+        region = self.api_tree.identify_region(event.x, event.y)
+        if region == "cell":
+            column = self.api_tree.identify_column(event.x)
+            item_id = self.api_tree.identify_row(event.y)
+            if not item_id: return
+            
+            if column == "#1": # 勾选框列
+                if item_id in self.selected_apis:
+                    self.selected_apis.remove(item_id)
+                    self.api_tree.set(item_id, column="check", value="☐")
+                else:
+                    self.selected_apis.add(item_id)
+                    self.api_tree.set(item_id, column="check", value="☑")
+            else: # 名称列
+                self.load_api_to_editor(item_id)
+
+    def select_all_visible(self):
+        """全选当前搜索可见的所有接口"""
+        for api in self.visible_apis:
+            self.selected_apis.add(api)
+            if self.api_tree.exists(api):
+                self.api_tree.set(api, column="check", value="☑")
+
+    def clear_all_selected(self):
+        """清空所有已勾选的接口"""
+        self.selected_apis.clear()
+        for item in self.api_tree.get_children():
+            self.api_tree.set(item, column="check", value="☐")
+
+    def load_api_to_editor(self, api_name):
+        """加载接口到右侧编辑器"""
         api_def = self.client.apis[api_name]
-        
-        # 优先从网关配置中获取 Path
-        gate_path = self.client.gateway_paths.get(api_name)
-        if not gate_path:
-            # 备选方案：如果网关目录没搜到，按常规规律构造
-            gate_path = f"/openapi/bhost/{api_def.version}/{api_name}.json"
+        gate_path = self.client.gateway_paths.get(api_name) or f"/openapi/bhost/{api_def.version}/{api_name}.json"
         
         self.path_ent.delete(0, tk.END)
         self.path_ent.insert(0, gate_path)
@@ -279,11 +329,13 @@ class ApiGui:
             self.current_api_name = api_name
             self.reset_param_template()
 
+    def on_api_select(self, event):
+        # Treeview 已经通过 on_tree_click 接管了单选逻辑，此方法保留为空或移除
+        pass
+
     def reset_param_template(self):
-        selection = self.api_listbox.curselection()
-        if not selection: return
-        api_name = self.api_listbox.get(selection[-1])
-        api_def = self.client.apis[api_name]
+        if not self.current_api_name: return
+        api_def = self.client.apis[self.current_api_name]
         template = {}
         for p_name, p_def in api_def.parameters.items():
             if p_def.required and p_def.tag_position != "System":
@@ -295,10 +347,9 @@ class ApiGui:
         self.param_text.insert("1.0", json.dumps(template, indent=2, ensure_ascii=False))
 
     def on_api_double_click(self, event):
-        selection = self.api_listbox.curselection()
-        if not selection: return
-        api_name = self.api_listbox.get(selection[-1])
-        api_def = self.client.apis[api_name]
+        item_id = self.api_tree.identify_row(event.y)
+        if not item_id: return
+        api_def = self.client.apis[item_id]
         try:
             if os.name == 'nt':
                 subprocess.run(['explorer', '/select,', api_def.file_path])
@@ -341,17 +392,16 @@ class ApiGui:
         return params
 
     def run_bulk_test(self):
-        selection = self.api_listbox.curselection()
-        if not selection:
-            messagebox.showwarning("Warning", "请选择接口")
+        if not self.selected_apis:
+            messagebox.showwarning("Warning", "请在左侧勾选要测试的接口")
             return
         
-        api_names = [self.api_listbox.get(i) for i in selection]
+        api_names = sorted(list(self.selected_apis))
         self.run_btn.config(state="disabled")
         self.bulk_btn.config(state="disabled")
 
         def bulk_task_thread():
-            self.log(f"--- 批量测试开始 (共 {len(api_names)} 个) ---", "bold")
+            self.log(f"--- 批量测试开始 (共 {len(api_names)} 个已勾选接口) ---", "bold")
             stats = {"total": 0, "success": 0, "fail": 0, "error": 0}
             
             # 使用用户设置的 host/port/proto
@@ -399,11 +449,11 @@ class ApiGui:
         threading.Thread(target=bulk_task_thread, daemon=True).start()
 
     def run_task(self):
-        selection = self.api_listbox.curselection()
-        if not selection:
-            messagebox.showwarning("Warning", "请选择接口")
+        if not self.current_api_name:
+            messagebox.showwarning("Warning", "请在列表中选择一个接口")
             return
-        api_name = self.api_listbox.get(selection[-1])
+        
+        api_name = self.current_api_name
         try:
             params = json.loads(self.param_text.get("1.0", tk.END))
         except:
