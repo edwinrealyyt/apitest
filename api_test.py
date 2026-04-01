@@ -1,4 +1,8 @@
 import os
+import sys
+import re
+import random
+import string
 import xml.etree.ElementTree as ET
 import requests
 import json
@@ -198,6 +202,11 @@ class ApiGui:
         self.concurrent_ent.insert(0, "1")
         self.concurrent_ent.pack(side="left", padx=5)
 
+        ttk.Label(row1, text="参数策略:").pack(side="left", padx=2)
+        self.strategy_cb = ttk.Combobox(row1, values=["固定值", "随机值"], width=8, state="readonly")
+        self.strategy_cb.set("固定值")
+        self.strategy_cb.pack(side="left", padx=5)
+
         row2 = ttk.Frame(config_frame)
         row2.pack(fill="x", padx=5, pady=5)
         
@@ -228,18 +237,27 @@ class ApiGui:
         ttk.Button(check_btn_frame, text="清空所有", command=self.clear_all_selected, width=10).pack(side="left", padx=2)
 
         # 使用 Treeview 替代 Listbox 以支持勾选框列
-        self.api_tree = ttk.Treeview(left_frame, columns=("check", "name"), show="headings", selectmode="browse")
+        tree_container = ttk.Frame(left_frame)
+        tree_container.pack(fill="both", expand=True)
+
+        self.api_tree = ttk.Treeview(tree_container, columns=("check", "name"), show="headings", selectmode="browse")
         self.api_tree.heading("check", text="√", anchor="center")
         self.api_tree.heading("name", text="接口名称", anchor="w")
         self.api_tree.column("check", width=35, stretch=False, anchor="center")
         self.api_tree.column("name", width=200, stretch=True)
-        self.api_tree.pack(fill="both", expand=True)
+        
+        scrollbar = ttk.Scrollbar(tree_container, orient="vertical", command=self.api_tree.yview)
+        self.api_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.api_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
         
         self.api_tree.bind("<Button-1>", self.on_tree_click)
         self.api_tree.bind("<Double-Button-1>", self.on_api_double_click)
         
         # 用于记录跨搜索持久化的勾选状态
         self.selected_apis = set()
+        self.bulk_results = [] # 存储批量测试的详细结果
         
         right_frame = ttk.Frame(main_paned)
         main_paned.add(right_frame, weight=3)
@@ -255,6 +273,8 @@ class ApiGui:
         self.run_btn.pack(side="left", padx=5)
         self.bulk_btn = ttk.Button(btn_frame, text="批量测试", command=self.run_bulk_test)
         self.bulk_btn.pack(side="left", padx=5)
+        self.bulk_details_btn = ttk.Button(btn_frame, text="查看批量详情", command=self.show_bulk_details, state="disabled")
+        self.bulk_details_btn.pack(side="left", padx=5)
         ttk.Button(btn_frame, text="重置模板", command=self.reset_param_template).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="清空日志", command=lambda: self.res_text.delete("1.0", tk.END)).pack(side="left")
         ttk.Button(btn_frame, text="退出程序", command=root.quit).pack(side="right")
@@ -274,14 +294,25 @@ class ApiGui:
         self.filter_apis()
 
     def filter_apis(self, *args):
-        search_term = self.search_var.get().lower()
+        search_input = self.search_var.get().strip()
+        # 使用正则表达式按空白字符或逗号分割搜索词
+        search_terms = [t.lower() for t in re.split(r'[\s,]+', search_input) if t]
+        
         # 清空当前视图
         for item in self.api_tree.get_children():
             self.api_tree.delete(item)
         
         self.visible_apis = []
         for api in self.all_apis:
-            if search_term in api.lower():
+            api_lower = api.lower()
+            
+            # 匹配逻辑：如果没有搜索词则显示所有；如果有，则接口名需包含其中任意一个词（OR 逻辑）
+            if not search_terms:
+                match = True
+            else:
+                match = any(term in api_lower for term in search_terms)
+            
+            if match:
                 self.visible_apis.append(api)
                 status = "☑" if api in self.selected_apis else "☐"
                 self.api_tree.insert("", "end", iid=api, values=(status, api))
@@ -365,8 +396,12 @@ class ApiGui:
 
     def generate_mock_params(self, api_def: ApiDefinition) -> Dict[str, Any]:
         """为接口生成默认参数"""
-        def get_default_value(param: ApiParameter):
+        strategy = self.strategy_cb.get()
+
+        def get_value(param: ApiParameter):
             name_lower = param.name.lower()
+            
+            # 特殊字段处理
             if "regionid" in name_lower: return "cn-hangzhou"
             if "page" in name_lower: return 1
             if "pagesize" in name_lower: return 10
@@ -374,21 +409,35 @@ class ApiGui:
             if param.param_type == "RepeatList":
                 item = {}
                 for sub_p_name, sub_p_def in param.sub_parameters.items():
-                    item[sub_p_name] = get_default_value(sub_p_def)
+                    item[sub_p_name] = get_value(sub_p_def)
                 return [item]
-            elif param.param_type in ["Integer", "Long"]:
-                return 1
-            elif param.param_type == "Boolean":
-                return True
-            elif param.param_type in ["Float", "Double"]:
-                return 1.0
+            
+            # 根据策略生成
+            if strategy == "随机值":
+                if param.param_type in ["Integer", "Long"]:
+                    return random.randint(1, 1000)
+                elif param.param_type == "Boolean":
+                    return random.choice([True, False])
+                elif param.param_type in ["Float", "Double"]:
+                    return round(random.uniform(1.0, 100.0), 2)
+                else:
+                    # 随机 8 位字符串
+                    return "".join(random.choices(string.ascii_letters + string.digits, k=8))
             else:
-                return "test_value"
+                # 固定值策略
+                if param.param_type in ["Integer", "Long"]:
+                    return 1
+                elif param.param_type == "Boolean":
+                    return True
+                elif param.param_type in ["Float", "Double"]:
+                    return 1.0
+                else:
+                    return "test_value"
 
         params = {}
         for p_name, p_def in api_def.parameters.items():
             if p_def.required and p_def.tag_position != "System":
-                params[p_name] = get_default_value(p_def)
+                params[p_name] = get_value(p_def)
         return params
 
     def run_bulk_test(self):
@@ -399,6 +448,8 @@ class ApiGui:
         api_names = sorted(list(self.selected_apis))
         self.run_btn.config(state="disabled")
         self.bulk_btn.config(state="disabled")
+        self.bulk_details_btn.config(state="disabled")
+        self.bulk_results = [] # 重置结果
 
         def bulk_task_thread():
             self.log(f"--- 批量测试开始 (共 {len(api_names)} 个已勾选接口) ---", "bold")
@@ -417,12 +468,23 @@ class ApiGui:
                 gate_path = self.client.gateway_paths.get(api_name) or f"/openapi/bhost/{api_def.version}/{api_name}.json"
                 
                 self.log(f"\n[测试接口 {stats['total']}/{len(api_names)}: {api_name}]")
-                result, _, full_url = self.client.call_api(api_name, params, gate_path)
+                result, actual_params, full_url = self.client.call_api(api_name, params, gate_path)
                 
+                res_info = {
+                    "name": api_name,
+                    "url": full_url,
+                    "params": actual_params,
+                    "status": "Error",
+                    "response": "",
+                    "error": ""
+                }
+
                 if isinstance(result, str):
                     self.log(f"请求异常: {result}", "error")
+                    res_info["error"] = result
                     stats["error"] += 1
                 else:
+                    res_info["status"] = str(result.status_code)
                     if 200 <= result.status_code < 300:
                         self.log(f"响应成功: {result.status_code}", "success")
                         stats["success"] += 1
@@ -431,9 +493,13 @@ class ApiGui:
                         stats["fail"] += 1
                     try:
                         resp_json = result.json()
+                        res_info["response"] = resp_json
                         self.log(f"内容摘要: {json.dumps(resp_json, ensure_ascii=False)[:200]}...")
                     except:
+                        res_info["response"] = result.text
                         self.log(f"内容摘要: {result.text[:200]}...")
+                
+                self.bulk_results.append(res_info)
             
             # 统计汇总
             self.log("\n" + "="*40)
@@ -444,9 +510,86 @@ class ApiGui:
             self.log(f"异常次数: {stats['error']}", "error")
             self.log("="*40 + "\n")
             
-            self.root.after(0, lambda: [self.run_btn.config(state="normal"), self.bulk_btn.config(state="normal")])
+            self.root.after(0, lambda: [
+                self.run_btn.config(state="normal"), 
+                self.bulk_btn.config(state="normal"),
+                self.bulk_details_btn.config(state="normal")
+            ])
             
         threading.Thread(target=bulk_task_thread, daemon=True).start()
+
+    def show_bulk_details(self):
+        """显示批量测试结果详情界面"""
+        if not self.bulk_results:
+            messagebox.showinfo("Info", "没有批量测试结果。")
+            return
+            
+        detail_win = tk.Toplevel(self.root)
+        detail_win.title("批量测试详情")
+        detail_win.geometry("1100x750")
+        
+        # 使用 PanedWindow 左右布局
+        paned = ttk.PanedWindow(detail_win, orient=tk.HORIZONTAL)
+        paned.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        left_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=1)
+        
+        ttk.Label(left_frame, text="接口列表:").pack(anchor="w")
+        
+        # 结果列表
+        res_tree_container = ttk.Frame(left_frame)
+        res_tree_container.pack(fill="both", expand=True)
+        
+        res_tree = ttk.Treeview(res_tree_container, columns=("status", "name"), show="headings", selectmode="browse")
+        res_tree.heading("status", text="状态", anchor="center")
+        res_tree.heading("name", text="接口名称", anchor="w")
+        res_tree.column("status", width=60, stretch=False, anchor="center")
+        res_tree.column("name", width=180, stretch=True)
+        
+        res_vsb = ttk.Scrollbar(res_tree_container, orient="vertical", command=res_tree.yview)
+        res_tree.configure(yscrollcommand=res_vsb.set)
+        
+        res_tree.pack(side="left", fill="both", expand=True)
+        res_vsb.pack(side="right", fill="y")
+        
+        right_frame = ttk.Frame(paned)
+        paned.add(right_frame, weight=3)
+        
+        ttk.Label(right_frame, text="请求与响应详情:").pack(anchor="w")
+        detail_text = scrolledtext.ScrolledText(right_frame, font=("Consolas", 10))
+        detail_text.pack(fill="both", expand=True)
+        
+        def on_res_select(event):
+            selected = res_tree.selection()
+            if not selected: return
+            idx = int(selected[0])
+            res = self.bulk_results[idx]
+            
+            detail_text.delete("1.0", tk.END)
+            detail_text.insert(tk.END, f"API名称: {res['name']}\n")
+            detail_text.insert(tk.END, f"响应状态: {res['status']}\n")
+            detail_text.insert(tk.END, f"请求URL: {res['url']}\n")
+            detail_text.insert(tk.END, "\n--- 实际打平参数 ---\n")
+            detail_text.insert(tk.END, json.dumps(res['params'], indent=2, ensure_ascii=False))
+            detail_text.insert(tk.END, "\n\n--- 响应内容 ---\n")
+            
+            if res['error']:
+                detail_text.insert(tk.END, f"Error: {res['error']}\n")
+            else:
+                try:
+                    detail_text.insert(tk.END, json.dumps(res['response'], indent=2, ensure_ascii=False))
+                except:
+                    detail_text.insert(tk.END, str(res['response']))
+
+        res_tree.bind("<<TreeviewSelect>>", on_res_select)
+        
+        # 填充列表
+        for i, res in enumerate(self.bulk_results):
+            res_tree.insert("", "end", iid=str(i), values=(res['status'], res['name']))
+        
+        if self.bulk_results:
+            res_tree.selection_set("0")
 
     def run_task(self):
         if not self.current_api_name:
