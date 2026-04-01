@@ -217,7 +217,7 @@ class ApiGui:
         self.search_var.trace("w", self.filter_apis)
         ttk.Entry(left_frame, textvariable=self.search_var).pack(fill="x", pady=2)
 
-        self.api_listbox = tk.Listbox(left_frame, font=("Consolas", 10), exportselection=False)
+        self.api_listbox = tk.Listbox(left_frame, font=("Consolas", 10), exportselection=False, selectmode=tk.EXTENDED)
         self.api_listbox.pack(fill="both", expand=True)
         self.api_listbox.bind("<<ListboxSelect>>", self.on_api_select)
         self.api_listbox.bind("<Double-Button-1>", self.on_api_double_click)
@@ -234,6 +234,8 @@ class ApiGui:
         btn_frame.pack(fill="x")
         self.run_btn = ttk.Button(btn_frame, text="提交请求", command=self.run_task)
         self.run_btn.pack(side="left", padx=5)
+        self.bulk_btn = ttk.Button(btn_frame, text="批量测试", command=self.run_bulk_test)
+        self.bulk_btn.pack(side="left", padx=5)
         ttk.Button(btn_frame, text="重置模板", command=self.reset_param_template).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="清空日志", command=lambda: self.res_text.delete("1.0", tk.END)).pack(side="left")
         ttk.Button(btn_frame, text="退出程序", command=root.quit).pack(side="right")
@@ -241,6 +243,12 @@ class ApiGui:
         ttk.Label(right_frame, text="执行结果:").pack(anchor="w", pady=(10,0))
         self.res_text = scrolledtext.ScrolledText(right_frame, font=("Consolas", 11), bg="#f5f5f5")
         self.res_text.pack(fill="both", expand=True, pady=5)
+
+        # 配置颜色标签
+        self.res_text.tag_config("success", foreground="#28a745")
+        self.res_text.tag_config("warning", foreground="#ffc107")
+        self.res_text.tag_config("error", foreground="#dc3545")
+        self.res_text.tag_config("bold", font=("Consolas", 11, "bold"))
 
         self.all_apis = sorted(list(self.client.apis.keys()))
         self.filter_apis()
@@ -255,7 +263,7 @@ class ApiGui:
     def on_api_select(self, event):
         selection = self.api_listbox.curselection()
         if not selection: return
-        api_name = self.api_listbox.get(selection[0])
+        api_name = self.api_listbox.get(selection[-1])
         api_def = self.client.apis[api_name]
         
         # 优先从网关配置中获取 Path
@@ -274,7 +282,7 @@ class ApiGui:
     def reset_param_template(self):
         selection = self.api_listbox.curselection()
         if not selection: return
-        api_name = self.api_listbox.get(selection[0])
+        api_name = self.api_listbox.get(selection[-1])
         api_def = self.client.apis[api_name]
         template = {}
         for p_name, p_def in api_def.parameters.items():
@@ -289,7 +297,7 @@ class ApiGui:
     def on_api_double_click(self, event):
         selection = self.api_listbox.curselection()
         if not selection: return
-        api_name = self.api_listbox.get(selection[0])
+        api_name = self.api_listbox.get(selection[-1])
         api_def = self.client.apis[api_name]
         try:
             if os.name == 'nt':
@@ -300,16 +308,102 @@ class ApiGui:
         except Exception as e:
             messagebox.showerror("Error", f"无法定位文件: {e}")
 
-    def log(self, msg):
-        self.res_text.insert(tk.END, str(msg) + "\n")
+    def log(self, msg, tag=None):
+        self.res_text.insert(tk.END, str(msg) + "\n", tag)
         self.res_text.see(tk.END)
+
+    def generate_mock_params(self, api_def: ApiDefinition) -> Dict[str, Any]:
+        """为接口生成默认参数"""
+        def get_default_value(param: ApiParameter):
+            name_lower = param.name.lower()
+            if "regionid" in name_lower: return "cn-hangzhou"
+            if "page" in name_lower: return 1
+            if "pagesize" in name_lower: return 10
+            
+            if param.param_type == "RepeatList":
+                item = {}
+                for sub_p_name, sub_p_def in param.sub_parameters.items():
+                    item[sub_p_name] = get_default_value(sub_p_def)
+                return [item]
+            elif param.param_type in ["Integer", "Long"]:
+                return 1
+            elif param.param_type == "Boolean":
+                return True
+            elif param.param_type in ["Float", "Double"]:
+                return 1.0
+            else:
+                return "test_value"
+
+        params = {}
+        for p_name, p_def in api_def.parameters.items():
+            if p_def.required and p_def.tag_position != "System":
+                params[p_name] = get_default_value(p_def)
+        return params
+
+    def run_bulk_test(self):
+        selection = self.api_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Warning", "请选择接口")
+            return
+        
+        api_names = [self.api_listbox.get(i) for i in selection]
+        self.run_btn.config(state="disabled")
+        self.bulk_btn.config(state="disabled")
+
+        def bulk_task_thread():
+            self.log(f"--- 批量测试开始 (共 {len(api_names)} 个) ---", "bold")
+            stats = {"total": 0, "success": 0, "fail": 0, "error": 0}
+            
+            # 使用用户设置的 host/port/proto
+            self.client.host = self.host_ent.get()
+            self.client.port = int(self.port_ent.get())
+            self.client.protocol = self.proto_cb.get()
+
+            for api_name in api_names:
+                stats["total"] += 1
+                api_def = self.client.apis[api_name]
+                params = self.generate_mock_params(api_def)
+                
+                gate_path = self.client.gateway_paths.get(api_name) or f"/openapi/bhost/{api_def.version}/{api_name}.json"
+                
+                self.log(f"\n[测试接口 {stats['total']}/{len(api_names)}: {api_name}]")
+                result, _, full_url = self.client.call_api(api_name, params, gate_path)
+                
+                if isinstance(result, str):
+                    self.log(f"请求异常: {result}", "error")
+                    stats["error"] += 1
+                else:
+                    if 200 <= result.status_code < 300:
+                        self.log(f"响应成功: {result.status_code}", "success")
+                        stats["success"] += 1
+                    else:
+                        self.log(f"响应失败: {result.status_code}", "warning")
+                        stats["fail"] += 1
+                    try:
+                        resp_json = result.json()
+                        self.log(f"内容摘要: {json.dumps(resp_json, ensure_ascii=False)[:200]}...")
+                    except:
+                        self.log(f"内容摘要: {result.text[:200]}...")
+            
+            # 统计汇总
+            self.log("\n" + "="*40)
+            self.log("批量测试结果统计:", "bold")
+            self.log(f"总测试数: {stats['total']}")
+            self.log(f"成功次数: {stats['success']}", "success")
+            self.log(f"失败次数: {stats['fail']}", "warning")
+            self.log(f"异常次数: {stats['error']}", "error")
+            self.log("="*40 + "\n")
+            
+            self.root.after(0, lambda: [self.run_btn.config(state="normal"), self.bulk_btn.config(state="normal")])
+            
+        threading.Thread(target=bulk_task_thread, daemon=True).start()
 
     def run_task(self):
         selection = self.api_listbox.curselection()
         if not selection:
             messagebox.showwarning("Warning", "请选择接口")
             return
-        api_name = self.api_listbox.get(selection[0])
+        api_name = self.api_listbox.get(selection[-1])
         try:
             params = json.loads(self.param_text.get("1.0", tk.END))
         except:
@@ -323,9 +417,10 @@ class ApiGui:
         
         count = int(self.concurrent_ent.get())
         self.run_btn.config(state="disabled")
+        self.bulk_btn.config(state="disabled")
         
         def task_thread():
-            self.log(f"--- 任务开始: {api_name} ---")
+            self.log(f"--- 任务开始: {api_name} ---", "bold")
             with ThreadPoolExecutor(max_workers=count) as executor:
                 futures = [executor.submit(self.client.call_api, api_name, params, custom_path) for _ in range(count)]
                 for i, future in enumerate(futures, 1):
@@ -335,15 +430,16 @@ class ApiGui:
                     self.log(f"\n实际打平参数:\n{json.dumps(actual_params, indent=2, ensure_ascii=False)}")
                     
                     if isinstance(result, str):
-                        self.log(f"\n请求失败: {result}")
+                        self.log(f"\n请求失败: {result}", "error")
                     else:
-                        self.log(f"\n响应状态码: {result.status_code}")
+                        tag = "success" if 200 <= result.status_code < 300 else "warning"
+                        self.log(f"\n响应状态码: {result.status_code}", tag)
                         try:
                             self.log(f"响应内容:\n{json.dumps(result.json(), indent=2, ensure_ascii=False)}")
                         except:
                             self.log(f"响应内容:\n{result.text[:2000]}")
-            self.log("\n--- 任务结束 ---")
-            self.root.after(0, lambda: self.run_btn.config(state="normal"))
+            self.log("\n--- 任务结束 ---", "bold")
+            self.root.after(0, lambda: [self.run_btn.config(state="normal"), self.bulk_btn.config(state="normal")])
         threading.Thread(target=task_thread, daemon=True).start()
 
 def main():
