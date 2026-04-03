@@ -22,12 +22,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # --- 核心逻辑类 ---
 
 class ApiParameter:
-    def __init__(self, name: str, tag_name: str, tag_position: str, param_type: str, required: bool):
+    def __init__(self, name: str, tag_name: str, tag_position: str, param_type: str, required: bool, description: str = "", example: str = ""):
         self.name = name
         self.tag_name = tag_name
         self.tag_position = tag_position
         self.param_type = param_type
         self.required = required
+        self.description = description
+        self.example = example
         self.sub_parameters: Dict[str, 'ApiParameter'] = {}
 
 class ApiDefinition:
@@ -110,39 +112,61 @@ class BastionHostApiClient:
             tag_name = param_node.attrib.get("tagName")
             tag_position = param_node.attrib.get("tagPosition", "Query")
             param_type = param_node.attrib.get("type", "String")
-            required = param_node.attrib.get("required", "false").lower() == "true"
-            param = ApiParameter(name, tag_name, tag_position, param_type, required)
+            # 增加容错：有的 XML 把 true 写成了 ture
+            req_str = param_node.attrib.get("required", "false").lower()
+            required = req_str == "true" or req_str == "ture"
+            
+            description = param_node.attrib.get("description", "")
+            example = param_node.attrib.get("example", "")
+            param = ApiParameter(name, tag_name, tag_position, param_type, required, description, example)
             sub_params_node = param_node.find("Parameters")
             if sub_params_node is not None:
                 self._parse_parameters(sub_params_node, param.sub_parameters)
             target_dict[name] = param
 
-    def flatten_params(self, input_params: Dict[str, Any], api_def: ApiDefinition) -> Dict[str, Any]:
+    def flatten_params(self, input_params: Dict[str, Any], api_def: ApiDefinition, use_json_for_complex: bool = True) -> Dict[str, Any]:
         flattened = {}
         def process(data: Any, param_defs: Dict[str, ApiParameter], prefix: str = ""):
             if isinstance(data, dict):
                 for key, value in data.items():
                     param_def = None
                     for p_name, p_def in param_defs.items():
+                        # 匹配原始名称或标签名
                         if p_name == key or p_def.tag_name == key or p_name.split('.')[-1] == key:
                             param_def = p_def
                             break
+                    
                     if not param_def:
                         flattened[prefix + key] = value
                         continue
+                    
+                    # 确定最终发送给后端的键名
+                    # 如果是 data. 开头的参数，且使用了 JSON 序列化模式，通常后端期望去掉 data. 的名称
+                    target_key = param_def.tag_name
+                    if use_json_for_complex and param_def.name.startswith("data."):
+                        target_key = param_def.name.replace("data.", "")
+
                     if param_def.param_type == "RepeatList" and isinstance(value, list):
-                        for i, item in enumerate(value, 1):
-                            process(item, param_def.sub_parameters, f"{prefix}{param_def.tag_name}.{i}.")
+                        if use_json_for_complex:
+                            # 模式1: 直接序列化为 JSON 字符串
+                            flattened[target_key] = json.dumps(value, ensure_ascii=False)
+                        else:
+                            # 模式2: 传统的 POP 打平方式 (Param.1.Key)
+                            for i, item in enumerate(value, 1):
+                                process(item, param_def.sub_parameters, f"{prefix}{target_key}.{i}.")
                     elif isinstance(value, (dict, list)):
-                        process(value, param_def.sub_parameters, f"{prefix}{param_def.tag_name}.")
+                        if use_json_for_complex and not prefix:
+                            flattened[target_key] = json.dumps(value, ensure_ascii=False)
+                        else:
+                            process(value, param_def.sub_parameters, f"{prefix}{target_key}.")
                     else:
-                        flattened[prefix + param_def.tag_name] = value
+                        flattened[prefix + target_key] = value
         process(input_params, api_def.parameters)
         return flattened
 
-    def call_api(self, api_name: str, params: Dict[str, Any], custom_path: str = None, method: str = None):
+    def call_api(self, api_name: str, params: Dict[str, Any], custom_path: str = None, method: str = None, use_json: bool = True):
         api_def = self.apis[api_name]
-        final_params = self.flatten_params(params, api_def)
+        final_params = self.flatten_params(params, api_def, use_json_for_complex=use_json)
         final_params["Action"] = api_name
         if "RequestId" not in final_params:
             final_params["RequestId"] = str(uuid.uuid4())
@@ -174,6 +198,8 @@ class ApiGui:
         self.root.geometry("1250x850")
         
         self.current_api_name = None
+        self.config_file = "server_configs.json"
+        self.server_configs = self.load_server_configs()
 
         # --- Config ---
         config_frame = ttk.LabelFrame(root, text="基本配置")
@@ -182,7 +208,19 @@ class ApiGui:
         row1 = ttk.Frame(config_frame)
         row1.pack(fill="x", padx=5, pady=2)
         
-        ttk.Label(row1, text="Host:").pack(side="left", padx=2)
+        ttk.Label(row1, text="配置列表:").pack(side="left", padx=2)
+        self.config_cb = ttk.Combobox(row1, values=list(self.server_configs.keys()), width=15, state="readonly")
+        self.config_cb.pack(side="left", padx=5)
+        self.config_cb.bind("<<ComboboxSelected>>", self.on_config_selected)
+        
+        ttk.Label(row1, text="别名:").pack(side="left", padx=2)
+        self.alias_ent = ttk.Entry(row1, width=12)
+        self.alias_ent.pack(side="left", padx=5)
+
+        ttk.Button(row1, text="保存", width=5, command=self.save_current_config).pack(side="left", padx=2)
+        ttk.Button(row1, text="删除", width=5, command=self.delete_selected_config).pack(side="left", padx=2)
+
+        ttk.Label(row1, text="Host:").pack(side="left", padx=(10, 2))
         self.host_ent = ttk.Entry(row1, width=20)
         self.host_ent.insert(0, client.host)
         self.host_ent.pack(side="left", padx=5)
@@ -206,6 +244,10 @@ class ApiGui:
         self.strategy_cb = ttk.Combobox(row1, values=["固定值", "随机值"], width=8, state="readonly")
         self.strategy_cb.set("固定值")
         self.strategy_cb.pack(side="left", padx=5)
+
+        self.json_var = tk.BooleanVar(value=True)
+        self.json_cb = ttk.Checkbutton(row1, text="JSON 模式", variable=self.json_var)
+        self.json_cb.pack(side="left", padx=5)
 
         row2 = ttk.Frame(config_frame)
         row2.pack(fill="x", padx=5, pady=5)
@@ -275,6 +317,7 @@ class ApiGui:
         self.bulk_btn.pack(side="left", padx=5)
         self.bulk_details_btn = ttk.Button(btn_frame, text="查看批量详情", command=self.show_bulk_details, state="disabled")
         self.bulk_details_btn.pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="自动填充", command=self.auto_fill_params).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="重置模板", command=self.reset_param_template).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="清空日志", command=lambda: self.res_text.delete("1.0", tk.END)).pack(side="left")
         ttk.Button(btn_frame, text="退出程序", command=root.quit).pack(side="right")
@@ -394,25 +437,106 @@ class ApiGui:
         self.res_text.insert(tk.END, str(msg) + "\n", tag)
         self.res_text.see(tk.END)
 
+    def load_server_configs(self) -> Dict[str, Dict[str, Any]]:
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except: pass
+        return {}
+
+    def save_current_config(self):
+        host = self.host_ent.get().strip()
+        port = self.port_ent.get().strip()
+        proto = self.proto_cb.get()
+        alias = self.alias_ent.get().strip()
+        
+        if not host: return
+        
+        # 优先使用别名，否则使用 URL
+        name = alias if alias else f"{proto}://{host}:{port}"
+        self.server_configs[name] = {"host": host, "port": port, "proto": proto, "alias": alias}
+        
+        with open(self.config_file, "w", encoding="utf-8") as f:
+            json.dump(self.server_configs, f, indent=2, ensure_ascii=False)
+        
+        self.config_cb["values"] = list(self.server_configs.keys())
+        self.config_cb.set(name)
+        messagebox.showinfo("Success", "配置已保存")
+
+    def delete_selected_config(self):
+        name = self.config_cb.get()
+        if name in self.server_configs:
+            del self.server_configs[name]
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(self.server_configs, f, indent=2, ensure_ascii=False)
+            self.config_cb["values"] = list(self.server_configs.keys())
+            self.config_cb.set("")
+            self.alias_ent.delete(0, tk.END)
+            messagebox.showinfo("Success", "配置已删除")
+
+    def on_config_selected(self, event):
+        name = self.config_cb.get()
+        if name in self.server_configs:
+            cfg = self.server_configs[name]
+            self.host_ent.delete(0, tk.END)
+            self.host_ent.insert(0, cfg["host"])
+            self.port_ent.delete(0, tk.END)
+            self.port_ent.insert(0, cfg["port"])
+            self.proto_cb.set(cfg["proto"])
+            self.alias_ent.delete(0, tk.END)
+            self.alias_ent.insert(0, cfg.get("alias", ""))
+
     def generate_mock_params(self, api_def: ApiDefinition) -> Dict[str, Any]:
         """为接口生成默认参数"""
         strategy = self.strategy_cb.get()
 
-        def get_value(param: ApiParameter):
+        def get_value(param: ApiParameter, force_all: bool = False):
             name_lower = param.name.lower()
+            desc_lower = param.description.lower()
             
-            # 特殊字段处理
+            # 1. 复杂类型 (RepeatList) 必须放在 example 之前
+            # 因为 example 经常是 "[]" 字符串，会覆盖真实的生成逻辑
+            if param.param_type == "RepeatList":
+                item = {}
+                # 递归生成所有子字段，防止后端因结构不完整报错
+                for sub_p_name, sub_p_def in param.sub_parameters.items():
+                    item[sub_p_name] = get_value(sub_p_def, force_all=True)
+                return [item]
+
+            # 2. 优先使用有效的示例值
+            if param.example and param.example not in ["xxx", "[]"]:
+                if param.param_type in ["Integer", "Long"]:
+                    try: return int(param.example)
+                    except: pass
+                elif param.param_type in ["Float", "Double"]:
+                    try: return float(param.example)
+                    except: pass
+                elif param.param_type == "Boolean":
+                    return str(param.example).lower() == "true"
+                return param.example
+
+            # 3. 特殊字段处理
             if "regionid" in name_lower: return "cn-hangzhou"
             if "page" in name_lower: return 1
             if "pagesize" in name_lower: return 10
             
-            if param.param_type == "RepeatList":
-                item = {}
-                for sub_p_name, sub_p_def in param.sub_parameters.items():
-                    item[sub_p_name] = get_value(sub_p_def)
-                return [item]
+            # 4. 从描述中解析限制
+            enum_match = re.search(r'[\[\(]([\w\s,，/|]+)[\]\)]', param.description)
+            if enum_match:
+                enums = [e.strip() for e in re.split(r'[,，/|]', enum_match.group(1)) if e.strip()]
+                if enums:
+                    return random.choice(enums) if strategy == "随机值" else enums[0]
             
-            # 根据策略生成
+            def_match = re.search(r'(?:默认值|default|取值)[:：]\s*([\w.-]+)', param.description, re.I)
+            if def_match:
+                val = def_match.group(1)
+                if param.param_type in ["Integer", "Long"]:
+                    try: return int(val)
+                    except: pass
+                return val
+
+            # 5. 根据类型和策略生成
             if strategy == "随机值":
                 if param.param_type in ["Integer", "Long"]:
                     return random.randint(1, 1000)
@@ -421,10 +545,8 @@ class ApiGui:
                 elif param.param_type in ["Float", "Double"]:
                     return round(random.uniform(1.0, 100.0), 2)
                 else:
-                    # 随机 8 位字符串
                     return "".join(random.choices(string.ascii_letters + string.digits, k=8))
             else:
-                # 固定值策略
                 if param.param_type in ["Integer", "Long"]:
                     return 1
                 elif param.param_type == "Boolean":
@@ -436,9 +558,22 @@ class ApiGui:
 
         params = {}
         for p_name, p_def in api_def.parameters.items():
-            if p_def.required and p_def.tag_position != "System":
-                params[p_name] = get_value(p_def)
+            if p_def.tag_position != "System":
+                if p_def.required or p_def.param_type == "RepeatList":
+                    params[p_name] = get_value(p_def)
         return params
+
+    def auto_fill_params(self):
+        """点击自动填充按钮后的逻辑"""
+        if not self.current_api_name:
+            messagebox.showwarning("Warning", "请在列表中选择一个接口")
+            return
+        
+        api_def = self.client.apis[self.current_api_name]
+        params = self.generate_mock_params(api_def)
+        
+        self.param_text.delete("1.0", tk.END)
+        self.param_text.insert("1.0", json.dumps(params, indent=2, ensure_ascii=False))
 
     def run_bulk_test(self):
         if not self.selected_apis:
@@ -468,7 +603,7 @@ class ApiGui:
                 gate_path = self.client.gateway_paths.get(api_name) or f"/openapi/bhost/{api_def.version}/{api_name}.json"
                 
                 self.log(f"\n[测试接口 {stats['total']}/{len(api_names)}: {api_name}]")
-                result, actual_params, full_url = self.client.call_api(api_name, params, gate_path)
+                result, actual_params, full_url = self.client.call_api(api_name, params, gate_path, use_json=self.json_var.get())
                 
                 res_info = {
                     "name": api_name,
@@ -597,11 +732,17 @@ class ApiGui:
             return
         
         api_name = self.current_api_name
+        api_def = self.client.apis[api_name]
+        strategy = self.strategy_cb.get()
+        
+        # 即使是随机模式，我们也先校验一下编辑器的 JSON，防止用户在固定模式下输入错误
         try:
-            params = json.loads(self.param_text.get("1.0", tk.END))
+            editor_params = json.loads(self.param_text.get("1.0", tk.END))
         except:
-            messagebox.showerror("Error", "JSON 格式有误。")
-            return
+            if strategy == "固定值":
+                messagebox.showerror("Error", "JSON 格式有误。")
+                return
+            editor_params = {}
 
         self.client.host = self.host_ent.get()
         self.client.port = int(self.port_ent.get())
@@ -613,10 +754,22 @@ class ApiGui:
         self.bulk_btn.config(state="disabled")
         
         def task_thread():
-            self.log(f"--- 任务开始: {api_name} ---", "bold")
+            self.log(f"--- 任务开始: {api_name} (策略: {strategy}, 并发: {count}) ---", "bold")
+            
             with ThreadPoolExecutor(max_workers=count) as executor:
-                futures = [executor.submit(self.client.call_api, api_name, params, custom_path) for _ in range(count)]
+                futures = []
+                for i in range(1, count + 1):
+                    # 逻辑：第一个请求 (i=1) 或 固定值策略时，使用编辑器内容
+                    # 只有当 i > 1 且策略为随机值时，才动态生成新参数
+                    if i == 1 or strategy == "固定值":
+                        current_p = editor_params
+                    else:
+                        current_p = self.generate_mock_params(api_def)
+                    
+                    futures.append(executor.submit(self.client.call_api, api_name, current_p, custom_path, use_json=self.json_var.get()))
+
                 for i, future in enumerate(futures, 1):
+                    result, actual_params, full_url = future.result()
                     result, actual_params, full_url = future.result()
                     self.log(f"\n[请求 #{i}]")
                     self.log(f"浏览器 URL:\n{full_url}")
