@@ -726,6 +726,142 @@ class ApiGui:
         if self.bulk_results:
             res_tree.selection_set("0")
 
+    def export_results_to_html(self):
+        """将批量测试结果导出为美观的 HTML 报告"""
+        if not self.bulk_results:
+            messagebox.showinfo("Info", "没有测试结果可以导出。")
+            return
+            
+        default_filename = f"api_test_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=[("HTML files", "*.html"), ("All files", "*.*")],
+            initialfile=default_filename,
+            title="选择导出路径"
+        )
+        
+        if not file_path:
+            return
+
+        html_template = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>BastionHost API 测试报告</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f8f9fa; color: #333; margin: 20px; }
+        .container { max-width: 1200px; margin: auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #007bff; border-bottom: 2px solid #eee; padding-bottom: 10px; }
+        .summary { display: flex; gap: 20px; margin-bottom: 20px; padding: 15px; background: #e9ecef; border-radius: 5px; }
+        .summary-item { font-weight: bold; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; table-layout: fixed; }
+        th, td { padding: 12px; border: 1px solid #dee2e6; text-align: left; vertical-align: top; overflow-wrap: break-word; }
+        th { background-color: #007bff; color: white; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+        .status-success { color: #28a745; font-weight: bold; }
+        .status-fail { color: #ffc107; font-weight: bold; }
+        .status-error { color: #dc3545; font-weight: bold; }
+        pre { background: #272822; color: #f8f8f2; padding: 10px; border-radius: 4px; font-size: 12px; white-space: pre-wrap; margin: 0; max-height: 300px; overflow-y: auto; }
+        .collapsible { cursor: pointer; color: #007bff; text-decoration: underline; font-size: 13px; }
+        .content { display: none; margin-top: 5px; }
+    </style>
+    <script>
+        function toggle(id) {
+            var x = document.getElementById(id);
+            x.style.display = (x.style.display === "none" || x.style.display === "") ? "block" : "none";
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>BastionHost API 测试报告</h1>
+        <div class="summary">
+            <div class="summary-item">生成时间: {now}</div>
+            <div class="summary-item">总计: {total}</div>
+            <div class="summary-item">成功: <span class="status-success">{success}</span></div>
+            <div class="summary-item">失败: <span class="status-fail">{fail}</span></div>
+            <div class="summary-item">异常: <span class="status-error">{error}</span></div>
+        </div>
+        <table>
+            <tr>
+                <th style="width: 15%;">接口名称</th>
+                <th style="width: 8%;">状态</th>
+                <th style="width: 35%;">请求信息</th>
+                <th style="width: 42%;">响应详情</th>
+            </tr>
+            {rows}
+        </table>
+    </div>
+</body>
+</html>
+"""
+        rows_html = ""
+        success_count = 0
+        fail_count = 0
+        error_count = 0
+        
+        for i, res in enumerate(self.bulk_results):
+            status_class = "status-success"
+            if res['status'] == "Error":
+                status_class = "status-error"
+                error_count += 1
+            elif int(res['status']) >= 300:
+                status_class = "status-fail"
+                fail_count += 1
+            else:
+                success_count += 1
+                
+            params_json = json.dumps(res['params'], indent=2, ensure_ascii=False)
+            try:
+                resp_json = json.dumps(res['response'], indent=2, ensure_ascii=False)
+            except:
+                resp_json = str(res['response'])
+            
+            row = f"""
+            <tr>
+                <td><strong>{res['name']}</strong></td>
+                <td><span class="{status_class}">{res['status']}</span></td>
+                <td>
+                    <div style="font-size: 11px; color: #666; margin-bottom: 5px;">URL: {res['url']}</div>
+                    <div class="collapsible" onclick="toggle('p{i}')">查看请求参数</div>
+                    <div id="p{i}" class="content"><pre>{params_json}</pre></div>
+                </td>
+                <td>
+                    {f'<div class="status-error">Error: {res["error"]}</div>' if res["error"] else ""}
+                    <div class="collapsible" onclick="toggle('r{i}')">查看响应内容</div>
+                    <div id="r{i}" class="content"><pre>{resp_json}</pre></div>
+                </td>
+            </tr>
+            """
+            rows_html += row
+
+        final_html = html_template.format(
+            now=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            total=len(self.bulk_results),
+            success=success_count,
+            fail=fail_count,
+            error=error_count,
+            rows=rows_html
+        )
+        
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(final_html)
+            
+            if messagebox.askyesno("Success", f"报告已成功导出至:\n{file_path}\n\n是否立即在浏览器中打开？"):
+                try:
+                    if os.name == 'nt':
+                        os.startfile(file_path)
+                    elif sys.platform == 'darwin':
+                        subprocess.call(('open', file_path))
+                    else:
+                        subprocess.call(('xdg-open', file_path))
+                except Exception as open_e:
+                    messagebox.showerror("Error", f"无法打开文件: {open_e}")
+        except Exception as e:
+            messagebox.showerror("Error", f"导出失败: {e}")
+
     def run_task(self):
         if not self.current_api_name:
             messagebox.showwarning("Warning", "请在列表中选择一个接口")
