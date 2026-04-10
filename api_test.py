@@ -53,6 +53,8 @@ class ScenarioStep:
         self.expected = expected
         self.mapped_api: Optional[str] = None
         self.status: str = "待测试"
+        self.params: Dict[str, Any] = {} # 用于存储修改后的参数
+        self.selected: bool = True # 默认勾选状态
 
 class BastionHostApiClient:
     def __init__(self, host: str, port: int, protocol: str = "http", base_path: str = "/"):
@@ -160,9 +162,13 @@ class ApiGui:
         self.root.title("BastionHost API Test Tool (Web & Scenario Enhanced)")
         self.root.geometry("1250x850")
         self.current_api_name = None; self.config_file = "server_configs.json"
+        self.success_params_file = "success_params.json"
         self.server_configs = self.load_server_configs(); self.scenario_steps: List[ScenarioStep] = []
+        self.last_error_message = ""; self.last_api_name = ""
+        self.success_params = self.load_success_params()
 
         # --- Top Config ---
+        # ... 原有 UI 逻辑开始 ...
         conf_f = ttk.LabelFrame(root, text="基本配置"); conf_f.pack(fill="x", padx=10, pady=5)
         r1 = ttk.Frame(conf_f); r1.pack(fill="x", padx=5, pady=2)
         ttk.Label(r1, text="配置列表:").pack(side="left")
@@ -211,10 +217,11 @@ class ApiGui:
         self.run_btn = ttk.Button(btn_bar, text="单次请求", command=self.run_task); self.run_btn.pack(side="left", padx=2)
         self.bulk_btn = ttk.Button(btn_bar, text="批量测试", command=self.run_bulk_test); self.bulk_btn.pack(side="left", padx=2)
         self.bulk_details_btn = ttk.Button(btn_bar, text="结果详情", command=self.show_bulk_details, state="disabled"); self.bulk_details_btn.pack(side="left", padx=2)
-        self.export_html_btn = ttk.Button(btn_bar, text="导出报告", command=self.export_results_to_html, state="disabled"); self.export_html_btn.pack(side="left", padx=2)
+        self.export_html_btn = ttk.Button(btn_bar, text="导出报告", command=self.export_results, state="disabled"); self.export_html_btn.pack(side="left", padx=2)
         ttk.Button(btn_bar, text="本地CSV导入", command=self.import_scenario_csv).pack(side="left", padx=2)
         ttk.Button(btn_bar, text="网页平台导入", command=self.import_from_web).pack(side="left", padx=2)
         ttk.Button(btn_bar, text="自动填充", command=self.auto_fill_params).pack(side="left", padx=2)
+        self.iter_var = tk.BooleanVar(value=False); ttk.Checkbutton(btn_bar, text="迭代模式", variable=self.iter_var).pack(side="left", padx=5)
         ttk.Button(btn_bar, text="清空日志", command=lambda: self.res_text.delete("1.0", tk.END)).pack(side="right")
 
         self.progress_var = tk.DoubleVar()
@@ -230,13 +237,10 @@ class ApiGui:
 
     def filter_apis(self, *args):
         search_raw = self.search_var.get().strip().lower()
-        # 支持空格、逗号、换行符分割多个关键字
         keywords = [k.strip() for k in re.split(r'[\s,\n]+', search_raw) if k.strip()]
-        
         for item in self.api_tree.get_children(): self.api_tree.delete(item)
         for api in self.all_apis:
             api_l = api.lower()
-            # 如果没有关键字，显示所有；如果有，匹配其中任意一个关键字即可显示
             if not keywords or any(k in api_l for k in keywords):
                 self.api_tree.insert("", "end", iid=api, values=("☑" if api in self.selected_apis else "☐", api))
 
@@ -250,7 +254,7 @@ class ApiGui:
         else:
             self.current_api_name = item_id; api_def = self.client.apis[item_id]
             self.path_ent.delete(0, tk.END); self.path_ent.insert(0, self.client.gateway_paths.get(item_id, "/"))
-            template = {pn: "" for pn, pd in api_def.parameters.items() if pd.required}
+            template = self.generate_mock_params(api_def)
             self.param_text.delete("1.0", tk.END); self.param_text.insert("1.0", json.dumps(template, indent=2, ensure_ascii=False))
 
     def on_api_double_click(self, event):
@@ -278,27 +282,136 @@ class ApiGui:
         self.port_ent.delete(0, tk.END); self.port_ent.insert(0, cfg['port'])
         self.proto_cb.set(cfg['proto']); self.alias_ent.delete(0, tk.END); self.alias_ent.insert(0, cfg.get('alias', ''))
 
+    def load_success_params(self):
+        if os.path.exists(self.success_params_file):
+            try:
+                with open(self.success_params_file, "r", encoding="utf-8") as f: return json.load(f)
+            except: pass
+        return {}
+
+    def save_success_params(self, api_name, params):
+        self.success_params[api_name] = params
+        with open(self.success_params_file, "w", encoding="utf-8") as f: json.dump(self.success_params, f, indent=2, ensure_ascii=False)
+
     def generate_mock_params(self, api_def: ApiDefinition) -> Dict[str, Any]:
-        strategy = self.strategy_cb.get()
+        if api_def.name in self.success_params:
+            return self.success_params[api_def.name].copy()
+        
         def get_v(p: ApiParameter):
-            n = p.name.lower()
             if p.param_type == "RepeatList":
-                if not p.sub_parameters:
-                    # 如果没有子参数，生成基础值列表 (修复基础 ID 列表格式错误)
+                if not p.sub_parameters: 
+                    strategy = self.strategy_cb.get()
                     return [random.randint(10, 99)] if strategy == "随机值" else [10]
-                item = {sn: get_v(sd) for sn, sd in p.sub_parameters.items()}
-                return [item]
-            if "id" in n: return random.randint(10, 99) if strategy == "随机值" else 10
-            if "ip" in n: return "10.0.0.1"
-            if p.param_type == "Boolean": return True
-            if p.param_type in ["Integer", "Long"]: return 1
-            return "test_" + "".join(random.choices(string.digits, k=4))
+                return [{sn: get_v(sd) for sn, sd in p.sub_parameters.items()}]
+            return self.generate_single_param(p)
+            
         return {pn: get_v(pd) for pn, pd in api_def.parameters.items() if pd.required or pd.param_type == "RepeatList"}
 
     def auto_fill_params(self):
-        if self.current_api_name:
+        if not self.current_api_name: return
+        api_def = self.client.apis[self.current_api_name]
+        
+        if self.iter_var.get():
+            threading.Thread(target=self.smart_fix_loop, args=(api_def,), daemon=True).start()
+        else:
+            try: current_params = json.loads(self.param_text.get("1.0", tk.END))
+            except: current_params = {}
+            
+            if not current_params:
+                current_params = self.generate_mock_params(api_def)
+            
+            if self.last_error_message and self.last_api_name == api_def.name:
+                self.apply_fix(api_def, current_params, self.last_error_message)
+            
             self.param_text.delete("1.0", tk.END)
-            self.param_text.insert("1.0", json.dumps(self.generate_mock_params(self.client.apis[self.current_api_name]), indent=2, ensure_ascii=False))
+            self.param_text.insert("1.0", json.dumps(current_params, indent=2, ensure_ascii=False))
+
+    def apply_fix(self, api_def, current_params, msg):
+        self.log(f"尝试修复: {msg}", "bold")
+        
+        # 1. 匹配缺失字段
+        missing_match = re.search(r'([A-Za-z0-9_]+)\s*(?:缺失|不能为空|Required|is mandatory)', msg)
+        if missing_match:
+            field = missing_match.group(1)
+            for pn, pd in api_def.parameters.items():
+                if pn.lower() == field.lower() or (pd.tag_name and pd.tag_name.lower() == field.lower()):
+                    current_params[pn] = self.generate_single_param(pd)
+                    self.log(f"已补全字段: {pn}", "success"); return True
+        
+        # 2. 匹配枚举值错误
+        enum_match = re.search(r'([A-Za-z0-9_]+)\s*(?:仅支持|only supports)\s*([\w:/,.-]+)', msg)
+        if enum_match:
+            field, val_part = enum_match.groups()
+            nums = re.findall(r'\d+', val_part)
+            if nums:
+                for pn in api_def.parameters:
+                    if pn.lower() == field.lower():
+                        current_params[pn] = int(nums[0])
+                        self.log(f"已修正枚举字段 {pn} 为: {nums[0]}", "success"); return True
+
+        # 3. 匹配 MAC 格式错误 (适配 Pydantic 报错格式)
+        if "MAC 地址格式" in msg or "valid MAC address" in msg.lower():
+            # 提取字段名，如 'start_mac': 'test_2079' 中的 start_mac
+            mac_fields = re.findall(r"['\"]([A-Za-z0-9_]*mac)['\"]:", msg, re.IGNORECASE)
+            if not mac_fields:
+                mac_fields = re.findall(r'([A-Za-z0-9_]*mac)\s*[:=]', msg, re.IGNORECASE)
+            
+            if mac_fields:
+                fixed_any = False
+                def deep_fix(data):
+                    nonlocal fixed_any
+                    if isinstance(data, dict):
+                        for k, v in list(data.items()):
+                            if any(mf.lower() == k.lower() for mf in mac_fields):
+                                data[k] = ":".join(["%02x" % random.randint(0, 255) for _ in range(6)])
+                                self.log(f"已修正 MAC 格式字段: {k}", "success")
+                                fixed_any = True
+                            deep_fix(v)
+                    elif isinstance(data, list):
+                        for item in data: deep_fix(item)
+                
+                deep_fix(current_params)
+                if fixed_any: return True
+        
+        return False
+
+    def smart_fix_loop(self, api_def):
+        self.log("--- 开启迭代修复模式 ---", "bold")
+        try: current_params = json.loads(self.param_text.get("1.0", tk.END))
+        except: current_params = self.generate_mock_params(api_def)
+        
+        for i in range(10): # 最多重试10次
+            self.root.after(0, lambda p=current_params: [self.param_text.delete("1.0", tk.END), self.param_text.insert("1.0", json.dumps(p, indent=2, ensure_ascii=False))])
+            
+            res, ap, url = self.client.call_api(api_def.name, current_params, path=self.path_ent.get().strip(), use_json=self.json_var.get())
+            if isinstance(res, str): self.log(f"网络错误: {res}", "error"); break
+            
+            try: resp_data = res.json()
+            except: resp_data = {"code": res.status_code, "message": res.text}
+            
+            biz_code = str(resp_data.get("code", res.status_code))
+            msg = resp_data.get("message", "")
+            
+            if biz_code.startswith("2"):
+                self.log(f"迭代成功! 状态码: {biz_code}", "success")
+                self.save_success_params(api_def.name, current_params)
+                break
+            
+            self.log(f"迭代 {i+1} 失败: {msg}", "warning")
+            if not self.apply_fix(api_def, current_params, msg):
+                self.log("无法自动识别报错模式，停止迭代", "error"); break
+            import time; time.sleep(0.5)
+
+    def generate_single_param(self, p: ApiParameter):
+        n = p.name.lower()
+        if "ip" in n: return "192.168.0.1"
+        if "port" in n: return 443
+        if "mac" in n: 
+            return ":".join(["%02x" % random.randint(0, 255) for _ in range(6)])
+        if "id" in n: return 1
+        if p.param_type == "Integer": return 1
+        if p.param_type == "Boolean": return True
+        return "test_" + "".join(random.choices(string.digits, k=4))
 
     def run_task(self):
         if not self.current_api_name: return
@@ -308,18 +421,26 @@ class ApiGui:
         except: self.log("JSON 格式错误", "error"); return
         self.log(f"--- 请求: {api_n} ---", "bold")
         res, ap, url = self.client.call_api(api_n, params, path=self.path_ent.get().strip(), use_json=self.json_var.get())
-        self.log(f"URL: {url}"); self.log(f"参数: {json.dumps(ap, ensure_ascii=False)}")
+        
+        # 恢复 URL 和参数的日志详情
+        self.log(f"URL: {url}")
+        self.log(f"打平参数: {json.dumps(ap, ensure_ascii=False)}")
+
         if isinstance(res, str): self.log(res, "error")
         else:
             resp_data = {}
             try: resp_data = res.json()
             except: pass
-            # 优先取业务 code，没有则取 HTTP 状态码
             biz_code = resp_data.get("code", res.status_code)
+            if str(biz_code).startswith("2"):
+                self.last_error_message = ""
+                self.save_success_params(api_n, params)
+            else:
+                self.last_error_message = resp_data.get("message", "")
+                self.last_api_name = api_n
             tag = "success" if str(biz_code).startswith("2") else "warning"
             self.log(f"状态: {biz_code}", tag)
-            if resp_data: self.log(f"响应: {json.dumps(resp_data, indent=2, ensure_ascii=False)}")
-            else: self.log(f"响应: {res.text[:1000]}")
+            self.log(f"响应: {json.dumps(resp_data, indent=2, ensure_ascii=False)}")
 
     def run_bulk_test(self):
         if not self.selected_apis: return
@@ -383,7 +504,10 @@ class ApiGui:
                 for r in rows[idx+1:]:
                     if len(r) >= 5 and r[0]:
                         s = ScenarioStep(r[0], r[1], r[2], r[3], r[4])
-                        s.mapped_api = self.guess_api(s); steps.append(s)
+                        s.mapped_api = self.guess_api(s)
+                        if s.mapped_api:
+                            s.params = self.generate_mock_params(self.client.apis[s.mapped_api])
+                        steps.append(s)
             self.scenario_steps = steps; self.show_scenario_manager()
         except Exception as e: messagebox.showerror("Error", f"加载失败: {e}")
 
@@ -442,40 +566,25 @@ class ApiGui:
 
         def do_import():
             base_url = url_ent.get().strip().rstrip('/')
-            folder = folder_cb.get()
-            label = file_cb.get()
+            folder, label = folder_cb.get(), file_cb.get()
             filename = file_map.get(label, label)
-            
-            if not folder or not label:
-                messagebox.showwarning("提示", "请先选择模块和文件")
-                return
-            
-            status_lbl.config(text=f"正在解析 [{label}] ...", foreground="blue")
+            if not folder or not label: return
             try:
                 resp = requests.post(f"{base_url}/api/preview", json={"folder": folder, "file": filename}, timeout=10)
-                data = resp.json()
-                rows = data.get("rows", [])
-                # ... 转换 ScenarioStep (保持原有逻辑) ...
+                rows = resp.json().get("rows", [])
                 steps = []
                 for r in rows:
                     s = ScenarioStep(r.get("uid"), r.get("所属模块", folder), r.get("测试项", "未命名"), r.get("步骤", ""), r.get("预期结果", ""))
                     s.mapped_api = self.guess_api(s)
+                    if s.mapped_api: # 自动生成初始参数
+                        s.params = self.generate_mock_params(self.client.apis[s.mapped_api])
                     steps.append(s)
-                
-                if steps:
-                    self.scenario_steps = steps
-                    web_win.destroy()
-                    self.show_scenario_manager()
-                else:
-                    status_lbl.config(text="无可用条目", foreground="orange")
-            except Exception as e:
-                messagebox.showerror("Error", f"导入失败: {e}")
+                if steps: self.scenario_steps = steps; web_win.destroy(); self.show_scenario_manager()
+            except Exception as e: messagebox.showerror("Error", f"导入失败: {e}")
 
         ttk.Button(url_f, text="连接", command=load_folders).pack(side="left", padx=5)
         folder_cb.bind("<<ComboboxSelected>>", on_folder_selected)
         ttk.Button(web_win, text="确定导入", command=do_import).pack(pady=20)
-        
-        # 如果已有地址，自动尝试一次加载
         if saved_url: threading.Thread(target=load_folders, daemon=True).start()
 
     def guess_api(self, s: ScenarioStep):
@@ -526,16 +635,15 @@ class ApiGui:
                 if any(syn in content for syn in chn_synonyms):
                     match_count += 1
             
-            # 3. 计算匹配得分：匹配到的单词数 / 接口总单词数 (占比越高越精准)
-            # 同时给予动作单词 (tokens[0]) 额外权重，因为它是接口的核心意图
+            # 3. 计算匹配得分
             score = (match_count / len(tokens)) * 10
             
-            # 核心意图加强：如果第一个动作单词匹配到了，加分
+            # 核心意图加强
             first_token_syns = DOMAIN_DICT.get(tokens[0], [])
             if any(syn in content for syn in first_token_syns):
                 score += 5
 
-            if score > 5: # 设定一个阈值，过滤掉低相关的匹配
+            if score > 5:
                 scores.append((score, api))
 
         # 降序排列，取最高分
@@ -545,42 +653,85 @@ class ApiGui:
         return None
 
     def show_scenario_manager(self):
-        mgr = tk.Toplevel(self.root); mgr.title("用例与接口映射"); mgr.geometry("1100x650")
-        ttk.Button(mgr, text="开始场景测试", command=lambda: self.run_scenario_tests(mgr)).pack(pady=5)
-        tree = ttk.Treeview(mgr, columns=("mod", "item", "api", "status"), show="headings"); tree.pack(fill="both", expand=True, padx=5)
-        for c, t in zip(["mod", "item", "api", "status"], ["模块", "测试项", "对应接口 (双击搜索修改)", "状态"]): tree.heading(c, text=t)
-        tree.column("item", width=350); tree.column("api", width=250)
-        def refresh():
+        mgr = tk.Toplevel(self.root); mgr.title("用例管理 (勾选执行/双击编辑)"); mgr.geometry("1200x700")
+        top_f = ttk.Frame(mgr); top_f.pack(fill="x", pady=5)
+        ttk.Button(top_f, text="全选", command=lambda: self.toggle_scenario_selection(True, refresh_fn)).pack(side="left", padx=5)
+        ttk.Button(top_f, text="取消全选", command=lambda: self.toggle_scenario_selection(False, refresh_fn)).pack(side="left", padx=5)
+        ttk.Button(top_f, text="开始执行勾选项", command=lambda: self.run_scenario_tests(mgr)).pack(side="right", padx=10)
+        
+        tree = ttk.Treeview(mgr, columns=("check", "mod", "item", "api", "params"), show="headings"); tree.pack(fill="both", expand=True, padx=5)
+        for c, t in zip(["check", "mod", "item", "api", "params"], ["√", "模块", "测试项", "对应接口 (双击搜索)", "参数预览 (双击修改)"]):
+            tree.heading(c, text=t)
+        tree.column("check", width=35, anchor="center"); tree.column("item", width=300); tree.column("api", width=200); tree.column("params", width=400)
+
+        def refresh_fn():
             for i in tree.get_children(): tree.delete(i)
-            for i, s in enumerate(self.scenario_steps): tree.insert("", "end", iid=str(i), values=(s.module, s.item, s.mapped_api or "未匹配", s.status))
-        def edit(e):
-            row = tree.identify_row(e.y)
-            if not row or tree.identify_column(e.x) != "#3": return
-            sel_win = tk.Toplevel(mgr); ent = ttk.Entry(sel_win, width=40); ent.pack(padx=10, pady=5)
-            lb = tk.Listbox(sel_win, width=60, height=15); lb.pack(padx=10, pady=5)
-            def up(*a):
-                lb.delete(0, tk.END)
-                for api in self.all_apis:
-                    if not ent.get() or ent.get().lower() in api.lower(): lb.insert(tk.END, api)
-            ent.bind("<KeyRelease>", up); up()
-            def cf():
-                if lb.curselection(): self.scenario_steps[int(row)].mapped_api = lb.get(lb.curselection()); refresh(); sel_win.destroy()
-            ttk.Button(sel_win, text="确定", command=cf).pack()
-        tree.bind("<Double-Button-1>", edit); refresh()
+            for i, s in enumerate(self.scenario_steps):
+                p_str = json.dumps(s.params, ensure_ascii=False)
+                tree.insert("", "end", iid=str(i), values=("☑" if s.selected else "☐", s.module, s.item, s.mapped_api or "未匹配", p_str))
+
+        def on_click(e):
+            row = tree.identify_row(e.y); col = tree.identify_column(e.x)
+            if row and col == "#1": # 切换勾选
+                idx = int(row)
+                self.scenario_steps[idx].selected = not self.scenario_steps[idx].selected
+                refresh_fn()
+
+        def on_double_click(e):
+            row = tree.identify_row(e.y); col = tree.identify_column(e.x)
+            if not row: return
+            idx = int(row)
+            if col == "#4": self.open_api_selector(mgr, idx, refresh_fn)
+            elif col == "#5": self.open_param_editor(mgr, idx, refresh_fn)
+
+        tree.bind("<Button-1>", on_click); tree.bind("<Double-Button-1>", on_double_click); refresh_fn()
+
+    def toggle_scenario_selection(self, state, refresh_fn):
+        for s in self.scenario_steps: s.selected = state
+        refresh_fn()
+
+    def open_api_selector(self, parent, idx, refresh_fn):
+        sel_win = tk.Toplevel(parent); sel_win.title("选择接口"); ent = ttk.Entry(sel_win, width=40); ent.pack(padx=10, pady=5)
+        lb = tk.Listbox(sel_win, width=60, height=15); lb.pack(padx=10, pady=5)
+        def up(*a):
+            lb.delete(0, tk.END)
+            for api in self.all_apis:
+                if not ent.get() or ent.get().lower() in api.lower(): lb.insert(tk.END, api)
+        ent.bind("<KeyRelease>", up); up()
+        def cf():
+            if lb.curselection():
+                api_n = lb.get(lb.curselection())
+                self.scenario_steps[idx].mapped_api = api_n
+                self.scenario_steps[idx].params = self.generate_mock_params(self.client.apis[api_n])
+                refresh_fn(); sel_win.destroy()
+        ttk.Button(sel_win, text="确定", command=cf).pack(pady=5)
+
+    def open_param_editor(self, parent, idx, refresh_fn):
+        edit_win = tk.Toplevel(parent); edit_win.title("编辑请求参数 (JSON)"); edit_win.geometry("600x500")
+        txt = scrolledtext.ScrolledText(edit_win, font=("Consolas", 11)); txt.pack(fill="both", expand=True, padx=5, pady=5)
+        txt.insert("1.0", json.dumps(self.scenario_steps[idx].params, indent=2, ensure_ascii=False))
+        def save():
+            try:
+                self.scenario_steps[idx].params = json.loads(txt.get("1.0", tk.END))
+                refresh_fn(); edit_win.destroy()
+            except Exception as e: messagebox.showerror("Error", f"JSON 格式错误: {e}")
+        ttk.Button(edit_win, text="保存参数", command=save).pack(pady=5)
 
     def run_scenario_tests(self, mgr):
         self.bulk_results = []
         def task():
-            total = len(self.scenario_steps); completed = 0
+            active_steps = [s for s in self.scenario_steps if s.selected and s.mapped_api]
+            if not active_steps:
+                self.root.after(0, lambda: messagebox.showwarning("提示", "没有选中的可执行用例"))
+                return
+            
+            total, completed = len(active_steps), 0
             self.root.after(0, lambda: self.progress_var.set(0))
             self.client.host, self.client.port, self.client.protocol = self.host_ent.get().strip(), int(self.port_ent.get()), self.proto_cb.get()
-            for i, s in enumerate(self.scenario_steps, 1):
-                if not s.mapped_api: 
-                    completed += 1
-                    self.root.after(0, lambda v=completed: self.progress_var.set((v/total)*100))
-                    continue
+            
+            for i, s in enumerate(active_steps, 1):
                 api_def = self.client.apis[s.mapped_api]
-                res, ap, url = self.client.call_api(s.mapped_api, self.generate_mock_params(api_def), use_json=self.json_var.get())
+                res, ap, url = self.client.call_api(s.mapped_api, s.params, use_json=self.json_var.get())
                 
                 resp_data = {}
                 if not isinstance(res, str):
@@ -588,24 +739,18 @@ class ApiGui:
                     except: pass
                     biz_code = resp_data.get("code", res.status_code)
                     s.status = f"完成 ({biz_code})"
-                else:
-                    s.status = "Error"
+                else: s.status = "Error"
                 
                 self.bulk_results.append({
-                    "name": f"[{s.item}] {s.mapped_api}", 
-                    "url": url, 
-                    "params": ap, 
+                    "name": f"[{s.item}] {s.mapped_api}", "url": url, "params": ap, 
                     "status": str(resp_data.get("code", res.status_code)) if not isinstance(res, str) else "Error", 
                     "response": resp_data or (res.text if not isinstance(res, str) else ""), 
-                    "error": res if isinstance(res, str) else "", 
-                    "expected": s.expected, 
-                    "api_desc": api_def.description
+                    "error": res if isinstance(res, str) else "", "expected": s.expected, "api_desc": api_def.description
                 })
                 completed += 1
                 self.root.after(0, lambda v=completed: self.progress_var.set((v/total)*100))
             
-            self.root.after(0, lambda: [messagebox.showinfo("Success", "场景测试执行完毕"), mgr.destroy(), self.bulk_details_btn.config(state="normal"), self.export_html_btn.config(state="normal")])
-        
+            self.root.after(0, lambda: [messagebox.showinfo("Success", f"执行完毕 ({total}项)"), mgr.destroy(), self.bulk_details_btn.config(state="normal"), self.export_html_btn.config(state="normal")])
         threading.Thread(target=task, daemon=True).start()
 
     def select_all_visible(self):
@@ -615,18 +760,42 @@ class ApiGui:
     def clear_all_selected(self):
         self.selected_apis.clear(); self.filter_apis()
 
-    def export_results_to_html(self):
+    def export_results(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"API_Report_{timestamp}.html"
-        path = filedialog.asksaveasfilename(defaultextension=".html", initialfile=default_name)
+        default_name = f"API_Report_{timestamp}"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=[("HTML Report", "*.html"), ("CSV Report", "*.csv")],
+            initialfile=default_name
+        )
         if not path: return
-        rows = ""
-        for r in self.bulk_results:
-            st_cl = "green" if str(r['status']).startswith("2") else "red"
-            rows += f"<tr><td><b>{r['name']}</b><br><small>{r.get('api_desc','')}</small></td><td style='color:{st_cl}'>{r['status']}</td><td>{r.get('expected','N/A')}</td><td><pre>{json.dumps(r['params'], indent=2, ensure_ascii=False)}</pre></td><td><pre>{json.dumps(r['response'], indent=2, ensure_ascii=False)}</pre></td></tr>"
-        html = f"<html><head><style>body{{font-family:sans-serif;}} table{{width:100%;border-collapse:collapse;}} th,td{{border:1px solid #ddd;padding:8px;vertical-align:top;font-size:12px;}} th{{background:#007bff;color:white;}} pre{{background:#272822;color:#f8f8f2;padding:5px;max-height:300px;overflow:auto;}}</style></head><body><h1>测试报告</h1><table><tr><th width='15%'>用例/接口</th><th width='8%'>状态</th><th width='15%'>预期结果</th><th width='30%'>请求参数</th><th width='32%'>响应结果</th></tr>{rows}</table></body></html>"
-        with open(path, "w", encoding="utf-8") as f: f.write(html)
-        if messagebox.askyesno("Success", "已生成报告，是否打开？"): os.startfile(path)
+
+        if path.endswith(".csv"):
+            try:
+                with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["接口名称", "描述", "状态", "预期结果", "请求参数", "响应结果", "URL"])
+                    for r in self.bulk_results:
+                        writer.writerow([
+                            r['name'],
+                            r.get('api_desc', ''),
+                            r['status'],
+                            r.get('expected', 'N/A'),
+                            json.dumps(r['params'], ensure_ascii=False),
+                            json.dumps(r['response'], ensure_ascii=False),
+                            r['url']
+                        ])
+                if messagebox.askyesno("Success", "CSV 报告已生成，是否打开？"): os.startfile(path)
+            except Exception as e:
+                messagebox.showerror("Error", f"导出 CSV 失败: {e}")
+        else:
+            rows = ""
+            for r in self.bulk_results:
+                st_cl = "green" if str(r['status']).startswith("2") else "red"
+                rows += f"<tr><td><b>{r['name']}</b><br><small>{r.get('api_desc','')}</small></td><td style='color:{st_cl}'>{r['status']}</td><td>{r.get('expected','N/A')}</td><td><pre>{json.dumps(r['params'], indent=2, ensure_ascii=False)}</pre></td><td><pre>{json.dumps(r['response'], indent=2, ensure_ascii=False)}</pre></td></tr>"
+            html = f"<html><head><style>body{{font-family:sans-serif;}} table{{width:100%;border-collapse:collapse;}} th,td{{border:1px solid #ddd;padding:8px;vertical-align:top;font-size:12px;}} th{{background:#007bff;color:white;}} pre{{background:#272822;color:#f8f8f2;padding:5px;max-height:300px;overflow:auto;}}</style></head><body><h1>测试报告</h1><table><tr><th width='15%'>用例/接口</th><th width='8%'>状态</th><th width='15%'>预期结果</th><th width='30%'>请求参数</th><th width='32%'>响应结果</th></tr>{rows}</table></body></html>"
+            with open(path, "w", encoding="utf-8") as f: f.write(html)
+            if messagebox.askyesno("Success", "HTML 报告已生成，是否打开？"): os.startfile(path)
 
 def main():
     p = argparse.ArgumentParser()
