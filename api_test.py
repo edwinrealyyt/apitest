@@ -142,9 +142,16 @@ class BastionHostApiClient:
         flattened = {}
         
         def get_key(p: ApiParameter, fallback: str):
-            if p and p.tag_name: return p.tag_name
-            if p and p.name: return p.name.replace("data.", "")
-            return fallback.replace("data.", "")
+            if not p: return fallback.replace("data.", "")
+            n_clean = p.name.replace("data.", "")
+            t_name = p.tag_name
+            
+            # 纠偏逻辑：如果原始名称包含 Set 而 tagName 不包含，优先用原始名称
+            # 解决如 UpdateSourceAuth 中 AuthModuleSet 被错误映射为 AuthModule 的问题
+            if t_name and "Set" in n_clean and "Set" not in t_name:
+                return n_clean
+            
+            return t_name if t_name else n_clean
 
         def map_obj_keys(data: Any, defs: Dict[str, ApiParameter]) -> Any:
             """仅用于 JSON 序列化前的字段名映射"""
