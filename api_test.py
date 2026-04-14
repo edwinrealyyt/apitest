@@ -64,6 +64,20 @@ class BastionHostApiClient:
         self.base_path = base_path
         self.apis: Dict[str, ApiDefinition] = {}
         self.gateway_paths: Dict[str, str] = {}
+        self.global_context = {}
+
+    def extract_context_from_response(self, response_data: Any):
+        def _recurse(data):
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k.lower().endswith("id") and v is not None and not isinstance(v, (dict, list)):
+                        self.global_context[k] = v
+                        self.global_context[k.lower()] = v
+                    _recurse(v)
+            elif isinstance(data, list):
+                for item in data:
+                    _recurse(item)
+        _recurse(response_data)
 
     def load_apis(self, pop_dir: str, gate_dir: str):
         for root, _, files in os.walk(pop_dir):
@@ -278,6 +292,7 @@ class ApiGui:
         ttk.Button(btn_bar, text="本地CSV导入", command=self.import_scenario_csv).pack(side="left", padx=2)
         ttk.Button(btn_bar, text="网页平台导入", command=self.import_from_web).pack(side="left", padx=2)
         ttk.Button(btn_bar, text="自动填充", command=self.auto_fill_params).pack(side="left", padx=2)
+        ttk.Button(btn_bar, text="生成 CRUD 链路", command=self.generate_crud_scenario).pack(side="left", padx=2)
         self.iter_var = tk.BooleanVar(value=False); ttk.Checkbutton(btn_bar, text="迭代模式", variable=self.iter_var).pack(side="left", padx=5)
         ttk.Button(btn_bar, text="清空日志", command=lambda: self.res_text.delete("1.0", tk.END)).pack(side="right")
 
@@ -522,12 +537,45 @@ class ApiGui:
             import time; time.sleep(0.5)
 
     def generate_single_param(self, p: ApiParameter):
+        # 1. 优先从全局上下文缓存中获取
+        if p.name in self.client.global_context:
+            return self.client.global_context[p.name]
+        if p.name.lower() in self.client.global_context:
+            return self.client.global_context[p.name.lower()]
+
         n = p.name.lower()
-        if "ip" in n: return "192.168.0.1"
-        if "port" in n: return 443
-        if "mac" in n: 
-            return ":".join(["%02x" % random.randint(0, 255) for _ in range(6)])
+        desc = p.description or ""
+
+        # 2. 从描述中尝试解析枚举值 (正则匹配：支持/可选值/枚举 等关键字后的选项)
+        # 匹配模式如：仅支持 Linux/Windows, 可选值：1,2,3, 包含：[a, b, c]
+        enum_patterns = [
+            r'(?:支持|可选值|枚举|包含|取值)[:：\s]*([a-zA-Z0-9_/，,\|（）\(\)\s]+)',
+            r'\[\s*([a-zA-Z0-9_/，,\|（）\(\)\s]+)\s*\]'
+        ]
+        for pattern in enum_patterns:
+            match = re.search(pattern, desc)
+            if match:
+                raw_vals = re.split(r'[/，,\|、\s]+', match.group(1).strip())
+                # 过滤掉括号、空值和非业务词汇
+                vals = [v.strip() for v in raw_vals if v.strip() and not re.match(r'^[（\(\)）]$', v)]
+                if vals:
+                    choice = random.choice(vals)
+                    # 如果参数类型是整数，尝试转换提取到的值
+                    if p.param_type == "Integer":
+                        num_match = re.search(r'\d+', choice)
+                        if num_match: return int(num_match.group())
+                    return choice
+
+        # 3. 语义推断逻辑
+        if "os" in n or "system" in n: return random.choice(["Linux", "Windows"])
+        if "email" in n: return f"test_{random.randint(100,999)}@example.com"
+        if "phone" in n or "mobile" in n: return "138" + "".join(random.choices(string.digits, k=8))
+        if "ip" in n: return f"10.0.{random.randint(0,255)}.{random.randint(1,254)}"
+        if "port" in n: return random.choice([22, 80, 443, 3389, 3306])
+        if "mac" in n: return ":".join(["%02x" % random.randint(0, 255) for _ in range(6)])
         if "id" in n: return 1
+
+        # 4. 基于数据类型的兜底
         if p.param_type == "Integer": return 1
         if p.param_type == "Boolean": return True
         return "test_" + "".join(random.choices(string.digits, k=4))
@@ -554,6 +602,7 @@ class ApiGui:
             if str(biz_code).startswith("2"):
                 self.last_error_message = ""
                 self.save_success_params(api_n, params)
+                self.client.extract_context_from_response(resp_data)
             else:
                 self.last_error_message = resp_data.get("message", "")
                 self.last_api_name = api_n
@@ -584,6 +633,8 @@ class ApiGui:
                                 biz_code = info["response"].get("code", r.status_code)
                                 info["status"] = str(biz_code)
                                 msg = info["response"].get("message", "")
+                                if info["status"].startswith("2"):
+                                    self.client.extract_context_from_response(info["response"])
                             except: 
                                 info["response"] = r.text
                                 info["status"] = str(r.status_code)
@@ -878,6 +929,50 @@ class ApiGui:
 
     def clear_all_selected(self):
         self.selected_apis.clear(); self.filter_apis()
+
+    def generate_crud_scenario(self):
+        if not self.current_api_name:
+            messagebox.showwarning("提示", "请先在左侧选择一个核心接口 (如 CreateHost)")
+            return
+        
+        # 1. 提取核心实体名
+        # 移除常见的动作前缀：Create, Delete, Update, Modify, Describe, List, Get
+        entity = re.sub(r'^(Create|Delete|Update|Modify|Describe|List|Get)', '', self.current_api_name)
+        if not entity:
+            messagebox.showwarning("提示", f"无法从接口名 '{self.current_api_name}' 中识别实体")
+            return
+
+        # 2. 定义 CRUD 动作及其匹配模式
+        actions = [
+            ("Create", ["Create"]),
+            ("Read/List", ["Describe", "List", "Get"]),
+            ("Update", ["Modify", "Update"]),
+            ("Delete", ["Delete"])
+        ]
+
+        steps = []
+        for label, prefixes in actions:
+            match_api = None
+            for prefix in prefixes:
+                potential_name = prefix + entity
+                if potential_name in self.all_apis:
+                    match_api = potential_name
+                    break
+            
+            if match_api:
+                s = ScenarioStep("", entity, f"{label}{entity}", f"执行 {match_api} 接口", "请求成功 (2xx)")
+                s.mapped_api = match_api
+                s.params = self.generate_mock_params(self.client.apis[match_api])
+                steps.append(s)
+
+        if not steps:
+            messagebox.showwarning("提示", f"未找到与实体 '{entity}' 相关的 CRUD 链路接口")
+            return
+
+        # 3. 合入场景列表并打开管理器
+        self.scenario_steps.extend(steps)
+        self.show_scenario_manager()
+        messagebox.showinfo("Success", f"已成功为实体 '{entity}' 生成 {len(steps)} 个链路步骤")
 
     def export_results(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
