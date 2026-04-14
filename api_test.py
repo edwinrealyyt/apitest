@@ -75,15 +75,18 @@ class BastionHostApiClient:
 
     def _parse_pop_xml(self, file_path: str):
         try:
-            tree = ET.parse(file_path)
-            root = tree.getroot()
+            root = ET.parse(file_path).getroot()
             if root.tag != "Api": return
+            
             api_def = ApiDefinition(root.attrib.get("name"), root.attrib.get("version", ""), [], [], file_path)
             api_def.description = root.attrib.get("description", "")
+            
             params_node = root.find("Parameters")
-            if params_node is not None: self._parse_parameters(params_node, api_def.parameters)
+            if params_node is not None: 
+                self._parse_parameters(params_node, api_def.parameters)
             self.apis[api_def.name] = api_def
-        except: pass
+        except Exception as e:
+            print(f"Error parsing {file_path}: {e}")
 
     def _parse_gate_xml(self, file_path: str):
         try:
@@ -96,31 +99,62 @@ class BastionHostApiClient:
         except: pass
 
     def _parse_parameters(self, parent_node: ET.Element, target_dict: Dict[str, ApiParameter]):
+        # 1. 强力黑名单（全小写，涵盖所有已知系统干扰项）
+        SYSTEM_BLACKLIST = {
+            "requestid", "callertype", "calluuid", "calleruid", 
+            "callersigned", "callerbid", "regionid", "accesskeyid", "signature",
+            "signaturemethod", "signaturenonce", "signatureversion", "timestamp", "version",
+            "callerparentid", "securitytoken", "appip", "sourceip", "lang",
+            "callersecuritytransport", "proxycallerip", "proxycallersecuritytransport",
+            "proxytrusttransportinfo", "mfapresent", "ststokencalleruid",
+            "ststokencallerbid", "ststokenprincipalid", "ststokenroleid", "ststokenuserid"
+        }
+        
         for p_node in parent_node.findall("Parameter"):
-            name = p_node.attrib.get("name")
+            name = p_node.attrib.get("name", "")
+            tag_name = p_node.attrib.get("tagName", "")
+            tag_pos = p_node.attrib.get("tagPosition", "")
+            
+            # 2. 字段名清洗逻辑
+            raw_key = tag_name if tag_name else name
+            clean_key = raw_key.replace("data.", "")
+            
+            # 3. 过滤逻辑：
+            # - 跳过黑名单中的字段
+            # - 跳过 tagPosition 为 System 的系统字段
+            # - 跳过空字段或已存在的字段
+            if clean_key.lower() in SYSTEM_BLACKLIST or tag_pos == "System":
+                continue
+            if not clean_key or clean_key in target_dict:
+                continue
+
             req = p_node.attrib.get("required", "false").lower() in ["true", "ture"]
-            param = ApiParameter(name, p_node.attrib.get("tagName"), "Query", p_node.attrib.get("type", "String"), req)
+            param = ApiParameter(name, tag_name, "Query", p_node.attrib.get("type", "String"), req)
+            param.description = p_node.attrib.get("description", "")
+            
             sub = p_node.find("Parameters")
-            if sub is not None: self._parse_parameters(sub, param.sub_parameters)
-            target_dict[name] = param
+            if sub is not None: 
+                self._parse_parameters(sub, param.sub_parameters)
+            
+            target_dict[clean_key] = param
 
     def flatten_params(self, input_params: Dict[str, Any], api_def: ApiDefinition, use_json: bool = True) -> Dict[str, Any]:
         flattened = {}
-        def get_key(p: ApiParameter):
-            n_clean = p.name.replace("data.", "")
-            return n_clean if ("Set" in n_clean and "Set" not in p.tag_name) else (p.tag_name or n_clean)
+        
+        def get_key(p: ApiParameter, fallback: str):
+            if p and p.tag_name: return p.tag_name
+            if p and p.name: return p.name.replace("data.", "")
+            return fallback.replace("data.", "")
 
-        def to_wire(data: Any, defs: Dict[str, ApiParameter]) -> Any:
+        def map_obj_keys(data: Any, defs: Dict[str, ApiParameter]) -> Any:
+            """仅用于 JSON 序列化前的字段名映射"""
             if isinstance(data, dict):
-                res = {}
-                for k, v in data.items():
-                    target = None
-                    for pn, pd in defs.items():
-                        if pn == k or pd.tag_name == k or pn.split('.')[-1] == k.replace("data.", ""):
-                            target = pd; break
-                    res[get_key(target) if target else k.replace("data.", "")] = to_wire(v, target.sub_parameters if target else {})
-                return res
-            return [to_wire(i, defs) for i in data] if isinstance(data, list) else data
+                return {get_key(next((pd for pn, pd in defs.items() if pn == k or pd.tag_name == k or pn.split('.')[-1] == k.replace("data.", "")), None), k): 
+                        map_obj_keys(v, next((pd.sub_parameters for pn, pd in defs.items() if pn == k or pd.tag_name == k or pn.split('.')[-1] == k.replace("data.", "")), {})) 
+                        for k, v in data.items()}
+            if isinstance(data, list):
+                return [map_obj_keys(i, defs) for i in data]
+            return data
 
         def proc(data: Any, defs: Dict[str, ApiParameter], pref: str = ""):
             if isinstance(data, dict):
@@ -129,16 +163,32 @@ class BastionHostApiClient:
                     for pn, pd in defs.items():
                         if pn == k or pd.tag_name == k or pn.split('.')[-1] == k.replace("data.", ""):
                             target = pd; break
-                    if not target: flattened[pref + k.replace("data.", "")] = v; continue
-                    tk = get_key(target)
-                    if target.param_type == "RepeatList" and isinstance(v, list):
-                        if use_json: flattened[tk] = json.dumps([to_wire(i, target.sub_parameters) for i in v], ensure_ascii=False)
+                    
+                    tk = get_key(target, k)
+                    full_key = pref + tk
+                    
+                    if isinstance(v, list):
+                        if use_json:
+                            # 关键：一旦是列表且开启 JSON 模式，立即映射并序列化，不再向下 proc
+                            mapped_list = map_obj_keys(v, target.sub_parameters if target else {})
+                            flattened[full_key] = json.dumps(mapped_list, ensure_ascii=False)
                         else:
-                            for i, item in enumerate(v, 1): proc(item, target.sub_parameters, f"{pref}{tk}.{i}.")
-                    elif isinstance(v, (dict, list)):
-                        if use_json and not pref: flattened[tk] = json.dumps(to_wire(v, target.sub_parameters), ensure_ascii=False)
-                        else: proc(v, target.sub_parameters, f"{pref}{tk}.")
-                    else: flattened[pref + tk] = v
+                            # 索引模式：AuthModuleSet.1.xxx
+                            for i, item in enumerate(v, 1):
+                                if isinstance(item, dict):
+                                    proc(item, target.sub_parameters if target else {}, f"{full_key}.{i}.")
+                                else:
+                                    flattened[f"{full_key}.{i}"] = item
+                    elif isinstance(v, dict):
+                        if use_json and not pref:
+                            # 顶层对象且 JSON 模式
+                            mapped_dict = map_obj_keys(v, target.sub_parameters if target else {})
+                            flattened[full_key] = json.dumps(mapped_dict, ensure_ascii=False)
+                        else:
+                            proc(v, target.sub_parameters if target else {}, f"{full_key}.")
+                    else:
+                        flattened[full_key] = v
+
         proc(input_params, api_def.parameters)
         return flattened
 
@@ -172,7 +222,7 @@ class ApiGui:
         conf_f = ttk.LabelFrame(root, text="基本配置"); conf_f.pack(fill="x", padx=10, pady=5)
         r1 = ttk.Frame(conf_f); r1.pack(fill="x", padx=5, pady=2)
         ttk.Label(r1, text="配置列表:").pack(side="left")
-        self.config_cb = ttk.Combobox(r1, values=list(self.server_configs.keys()), width=15, state="readonly"); self.config_cb.pack(side="left", padx=5)
+        self.config_cb = ttk.Combobox(r1, values=[k for k in self.server_configs.keys() if not k.startswith("_")], width=15, state="readonly"); self.config_cb.pack(side="left", padx=5)
         self.config_cb.bind("<<ComboboxSelected>>", self.on_config_selected)
         self.alias_ent = ttk.Entry(r1, width=12); self.alias_ent.pack(side="left", padx=2)
         ttk.Button(r1, text="保存", command=self.save_current_config, width=5).pack(side="left", padx=2)
@@ -254,7 +304,14 @@ class ApiGui:
         else:
             self.current_api_name = item_id; api_def = self.client.apis[item_id]
             self.path_ent.delete(0, tk.END); self.path_ent.insert(0, self.client.gateway_paths.get(item_id, "/"))
+            
+            # 首先生成一个拥有完整、正确嵌套层级的参数树
             template = self.generate_mock_params(api_def)
+            
+            # 点击接口时，如果有历史记录，则强制全量恢复历史（覆盖掉刚才生成的随机业务字段）
+            if item_id in self.success_params:
+                self._deep_update(template, self.success_params[item_id])
+                
             self.param_text.delete("1.0", tk.END); self.param_text.insert("1.0", json.dumps(template, indent=2, ensure_ascii=False))
 
     def on_api_double_click(self, event):
@@ -293,32 +350,89 @@ class ApiGui:
         self.success_params[api_name] = params
         with open(self.success_params_file, "w", encoding="utf-8") as f: json.dump(self.success_params, f, indent=2, ensure_ascii=False)
 
-    def generate_mock_params(self, api_def: ApiDefinition) -> Dict[str, Any]:
-        if api_def.name in self.success_params:
-            return self.success_params[api_def.name].copy()
-        
+    def generate_mock_params(self, api_def: ApiDefinition, include_optional: bool = True) -> Dict[str, Any]:
+        strategy = self.strategy_cb.get()
         def get_v(p: ApiParameter):
             if p.param_type == "RepeatList":
                 if not p.sub_parameters: 
-                    strategy = self.strategy_cb.get()
                     return [random.randint(10, 99)] if strategy == "随机值" else [10]
                 return [{sn: get_v(sd) for sn, sd in p.sub_parameters.items()}]
+
+            if not p.required and not include_optional:
+                if p.param_type == "Integer": return 0
+                if p.param_type == "Boolean": return False
+                return ""
+
             return self.generate_single_param(p)
-            
-        return {pn: get_v(pd) for pn, pd in api_def.parameters.items() if pd.required or pd.param_type == "RepeatList"}
+
+        # 生成包含所有字段的基础模板
+        params = {pn: get_v(pd) for pn, pd in api_def.parameters.items()}
+
+        # 融合历史成功的参数
+        if api_def.name in self.success_params:
+            history = self.success_params[api_def.name]
+            if strategy == "固定值":
+                self._deep_update(params, history)
+            else:
+                # 随机值模式：仅从历史中恢复 InstanceId 等“环境依赖”字段
+                self._deep_update_selective(params, history)
+        return params
+
+    def _deep_update_selective(self, target, source):
+        """选择性更新：在随机模式下，仅恢复 ID 类关键环境参数"""
+        ESSENTIAL_KEYS = {"instanceid", "regionid", "aliuid", "calleruid"}
+        for k, v in source.items():
+            if k in target:
+                k_low = k.lower()
+                if isinstance(v, dict) and isinstance(target[k], dict):
+                    self._deep_update_selective(target[k], v)
+                else:
+                    # 环境关键 ID，或 target 当前为空，才从历史恢复
+                    if any(ek in k_low for ek in ESSENTIAL_KEYS) or target[k] in ["", 0, None, []]:
+                        target[k] = v
+    def _deep_update(self, target, source):
+        """深度更新：仅当键在 target 中存在时，才用 source 的值覆盖"""
+        for k, v in source.items():
+            # 只有当该键是当前 API 定义中合法的业务参数时，才允许从历史记录恢复
+            if k in target:
+                if isinstance(v, dict) and isinstance(target[k], dict):
+                    self._deep_update(target[k], v)
+                else:
+                    target[k] = v
+            # 如果 k 不在 target 中，说明它是已被过滤的系统参数或旧版残留的 data. 参数，直接丢弃，不再合入
+
+    def _deep_complement(self, target, source):
+        """深度补全：将 source 中缺失或为空的字段补到 target"""
+        for k, v in source.items():
+            if k not in target or target[k] == "" or target[k] == [] or target[k] is None:
+                target[k] = v
+            elif isinstance(v, dict) and isinstance(target[k], dict):
+                self._deep_complement(target[k], v)
 
     def auto_fill_params(self):
         if not self.current_api_name: return
         api_def = self.client.apis[self.current_api_name]
         
         if self.iter_var.get():
-            threading.Thread(target=self.smart_fix_loop, args=(api_def,), daemon=True).start()
+            # 同步当前 UI 配置并启动迭代
+            self.client.host, self.client.port, self.client.protocol = self.host_ent.get().strip(), int(self.port_ent.get()), self.proto_cb.get()
+            path = self.path_ent.get().strip()
+            use_json = self.json_var.get()
+            try: current_params = json.loads(self.param_text.get("1.0", tk.END))
+            except: current_params = self.generate_mock_params(api_def)
+            threading.Thread(target=self.smart_fix_loop, args=(api_def, current_params, path, use_json), daemon=True).start()
         else:
             try: current_params = json.loads(self.param_text.get("1.0", tk.END))
             except: current_params = {}
             
+            # 生成完整模板（含非必需参数 + 历史成功值）
+            full_template = self.generate_mock_params(api_def, include_optional=True)
+            
             if not current_params:
-                current_params = self.generate_mock_params(api_def)
+                current_params = full_template
+            else:
+                # 补全当前文本框 JSON 中缺失的字段
+                self._deep_complement(current_params, full_template)
             
             if self.last_error_message and self.last_api_name == api_def.name:
                 self.apply_fix(api_def, current_params, self.last_error_message)
@@ -375,15 +489,13 @@ class ApiGui:
         
         return False
 
-    def smart_fix_loop(self, api_def):
+    def smart_fix_loop(self, api_def, current_params, path, use_json):
         self.log("--- 开启迭代修复模式 ---", "bold")
-        try: current_params = json.loads(self.param_text.get("1.0", tk.END))
-        except: current_params = self.generate_mock_params(api_def)
         
         for i in range(10): # 最多重试10次
             self.root.after(0, lambda p=current_params: [self.param_text.delete("1.0", tk.END), self.param_text.insert("1.0", json.dumps(p, indent=2, ensure_ascii=False))])
             
-            res, ap, url = self.client.call_api(api_def.name, current_params, path=self.path_ent.get().strip(), use_json=self.json_var.get())
+            res, ap, url = self.client.call_api(api_def.name, current_params, path=path, use_json=use_json)
             if isinstance(res, str): self.log(f"网络错误: {res}", "error"); break
             
             try: resp_data = res.json()
@@ -440,7 +552,7 @@ class ApiGui:
                 self.last_api_name = api_n
             tag = "success" if str(biz_code).startswith("2") else "warning"
             self.log(f"状态: {biz_code}", tag)
-            self.log(f"响应: {json.dumps(resp_data, indent=2, ensure_ascii=False)}")
+            self.log(f"响应: {json.dumps(resp_data, ensure_ascii=False)}")
 
     def run_bulk_test(self):
         if not self.selected_apis: return
