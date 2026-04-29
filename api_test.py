@@ -11,6 +11,7 @@ import uuid
 import threading
 import subprocess
 import csv
+import openpyxl
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
@@ -340,7 +341,14 @@ class ApiGui:
         item_id = self.api_tree.identify_row(event.y)
         if item_id and os.name == 'nt': subprocess.run(['explorer', '/select,', self.client.apis[item_id].file_path])
 
-    def log(self, msg, tag=None): self.res_text.insert(tk.END, str(msg) + "\n", tag); self.res_text.see(tk.END)
+    def log(self, msg, tag=None):
+        # 限制单条日志显示长度，防止超大响应导致 UI 渲染卡死
+        max_display = 10000
+        msg_str = str(msg)
+        if len(msg_str) > max_display:
+            msg_str = msg_str[:max_display] + f"\n... [内容过长已截断，总计 {len(msg_str)} 字符，请通过‘结果详情’查看或导出报告]"
+        self.res_text.insert(tk.END, msg_str + "\n", tag)
+        self.res_text.see(tk.END)
 
     def load_server_configs(self):
         if os.path.exists(self.config_file):
@@ -584,31 +592,49 @@ class ApiGui:
         if not self.current_api_name: return
         self.client.host, self.client.port, self.client.protocol = self.host_ent.get().strip(), int(self.port_ent.get()), self.proto_cb.get()
         api_n = self.current_api_name
+        api_def = self.client.apis[api_n]
         try: params = json.loads(self.param_text.get("1.0", tk.END))
         except: self.log("JSON 格式错误", "error"); return
         self.log(f"--- 请求: {api_n} ---", "bold")
         res, ap, url = self.client.call_api(api_n, params, path=self.path_ent.get().strip(), use_json=self.json_var.get())
         
-        # 恢复 URL 和参数的日志详情
         self.log(f"URL: {url}")
         self.log(f"打平参数: {json.dumps(ap, ensure_ascii=False)}")
 
-        if isinstance(res, str): self.log(res, "error")
+        # 构造结果详情所需的数据结构
+        info = {"name": api_n, "url": url, "params": ap, "status": "Error", "response": "", "error": "", "api_desc": api_def.description}
+
+        if isinstance(res, str): 
+            self.log(res, "error")
+            info["error"] = res
         else:
             resp_data = {}
-            try: resp_data = res.json()
-            except: pass
-            biz_code = resp_data.get("code", res.status_code)
+            try: 
+                resp_data = res.json()
+                info["response"] = resp_data
+                biz_code = resp_data.get("code", res.status_code)
+                info["status"] = str(biz_code)
+            except: 
+                info["response"] = res.text
+                info["status"] = str(res.status_code)
+                biz_code = res.status_code
+            
             if str(biz_code).startswith("2"):
                 self.last_error_message = ""
                 self.save_success_params(api_n, params)
                 self.client.extract_context_from_response(resp_data)
             else:
-                self.last_error_message = resp_data.get("message", "")
+                self.last_error_message = resp_data.get("message", "") if isinstance(resp_data, dict) else ""
                 self.last_api_name = api_n
+            
             tag = "success" if str(biz_code).startswith("2") else "warning"
             self.log(f"状态: {biz_code}", tag)
             self.log(f"响应: {json.dumps(resp_data, ensure_ascii=False)}")
+
+        # 更新全局结果列表并启用详情/导出按钮
+        self.bulk_results = [info]
+        self.bulk_details_btn.config(state="normal")
+        self.export_html_btn.config(state="normal")
 
     def run_bulk_test(self):
         if not self.selected_apis: return
@@ -659,7 +685,13 @@ class ApiGui:
             sel = tree.selection()
             if sel:
                 r = self.bulk_results[int(sel[0])]
-                txt.delete("1.0", tk.END); txt.insert(tk.END, f"API: {r['name']}\nURL: {r['url']}\n\n[打平参数]\n{json.dumps(r['params'], indent=2, ensure_ascii=False)}\n\n[响应内容]\n{json.dumps(r['response'], indent=2, ensure_ascii=False)}\n{r['error']}")
+                txt.delete("1.0", tk.END)
+                resp_str = json.dumps(r['response'], indent=2, ensure_ascii=False)
+                # 详情页截断阈值设为 50KB，既保证可见性又防止卡死
+                limit = 50000
+                if len(resp_str) > limit:
+                    resp_str = resp_str[:limit] + f"\n\n--- [内容过长已截断，总计 {len(resp_str)} 字符，请导出报告查看完整内容] ---"
+                txt.insert(tk.END, f"API: {r['name']}\nURL: {r['url']}\n\n[打平参数]\n{json.dumps(r['params'], indent=2, ensure_ascii=False)}\n\n[响应内容]\n{resp_str}\n{r['error']}")
         tree.bind("<<TreeviewSelect>>", show_v)
         for i, r in enumerate(self.bulk_results): tree.insert("", "end", iid=str(i), values=(r['status'], r['name']))
 
@@ -978,38 +1010,58 @@ class ApiGui:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_name = f"API_Report_{timestamp}"
         path = filedialog.asksaveasfilename(
-            defaultextension=".html",
-            filetypes=[("HTML Report", "*.html"), ("CSV Report", "*.csv")],
+            defaultextension=".xlsx",
+            filetypes=[("Excel Report", "*.xlsx"), ("HTML Report", "*.html"), ("CSV Report", "*.csv")],
             initialfile=default_name
         )
         if not path: return
 
-        if path.endswith(".csv"):
+        def task():
+            self.log(f"--- 正在导出报告: {os.path.basename(path)} ---", "bold")
+            # 定义统一的表头和数据映射
+            headers = ["接口名称", "状态", "请求参数", "描述", "响应结果", "预期结果", "测试结果", "备注"]
+            
+            def get_row_data(r):
+                test_result = "成功" if str(r['status']).startswith("2") else "失败"
+                return [
+                    r['name'],
+                    r['status'],
+                    json.dumps(r['params'], ensure_ascii=False),
+                    r.get('api_desc', ''),
+                    json.dumps(r['response'], ensure_ascii=False),
+                    r.get('expected', 'N/A'),
+                    test_result,
+                    r['url']
+                ]
+
             try:
-                with open(path, "w", encoding="utf-8-sig", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["接口名称", "描述", "状态", "预期结果", "请求参数", "响应结果", "URL"])
+                if path.endswith(".xlsx"):
+                    wb = openpyxl.Workbook()
+                    ws = wb.active; ws.title = "测试报告"
+                    ws.append(headers)
+                    for r in self.bulk_results: ws.append(get_row_data(r))
+                    for cell in ws[1]: cell.font = openpyxl.styles.Font(bold=True)
+                    wb.save(path)
+                elif path.endswith(".csv"):
+                    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(headers)
+                        for r in self.bulk_results: writer.writerow(get_row_data(r))
+                else:
+                    rows = ""
                     for r in self.bulk_results:
-                        writer.writerow([
-                            r['name'],
-                            r.get('api_desc', ''),
-                            r['status'],
-                            r.get('expected', 'N/A'),
-                            json.dumps(r['params'], ensure_ascii=False),
-                            json.dumps(r['response'], ensure_ascii=False),
-                            r['url']
-                        ])
-                if messagebox.askyesno("Success", "CSV 报告已生成，是否打开？"): os.startfile(path)
+                        data = get_row_data(r)
+                        st_cl = "green" if data[6] == "成功" else "red"
+                        rows += f"<tr><td><b>{data[0]}</b></td><td style='color:{st_cl}'>{data[1]}</td><td><pre>{json.dumps(r['params'], indent=2, ensure_ascii=False)}</pre></td><td>{data[3]}</td><td><pre>{json.dumps(r['response'], indent=2, ensure_ascii=False)}</pre></td><td>{data[5]}</td><td style='color:{st_cl}'>{data[6]}</td><td><small>{data[7]}</small></td></tr>"
+                    html_headers = "".join([f"<th>{h}</th>" for h in headers])
+                    html = f"<html><head><meta charset='utf-8'><style>body{{font-family:sans-serif;}} table{{width:100%;border-collapse:collapse;}} th,td{{border:1px solid #ddd;padding:8px;vertical-align:top;font-size:12px;}} th{{background:#007bff;color:white;}} pre{{background:#f8f9fa;color:#333;padding:5px;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all;border:1px solid #eee;}}</style></head><body><h1>API 测试报告</h1><table><tr>{html_headers}</tr>{rows}</table></body></html>"
+                    with open(path, "w", encoding="utf-8") as f: f.write(html)
+                
+                self.root.after(0, lambda: [self.log("报告导出成功", "success"), messagebox.showinfo("Success", "报告已生成")])
             except Exception as e:
-                messagebox.showerror("Error", f"导出 CSV 失败: {e}")
-        else:
-            rows = ""
-            for r in self.bulk_results:
-                st_cl = "green" if str(r['status']).startswith("2") else "red"
-                rows += f"<tr><td><b>{r['name']}</b><br><small>{r.get('api_desc','')}</small></td><td style='color:{st_cl}'>{r['status']}</td><td>{r.get('expected','N/A')}</td><td><pre>{json.dumps(r['params'], indent=2, ensure_ascii=False)}</pre></td><td><pre>{json.dumps(r['response'], indent=2, ensure_ascii=False)}</pre></td></tr>"
-            html = f"<html><head><style>body{{font-family:sans-serif;}} table{{width:100%;border-collapse:collapse;}} th,td{{border:1px solid #ddd;padding:8px;vertical-align:top;font-size:12px;}} th{{background:#007bff;color:white;}} pre{{background:#272822;color:#f8f8f2;padding:5px;max-height:300px;overflow:auto;}}</style></head><body><h1>测试报告</h1><table><tr><th width='15%'>用例/接口</th><th width='8%'>状态</th><th width='15%'>预期结果</th><th width='30%'>请求参数</th><th width='32%'>响应结果</th></tr>{rows}</table></body></html>"
-            with open(path, "w", encoding="utf-8") as f: f.write(html)
-            if messagebox.askyesno("Success", "HTML 报告已生成，是否打开？"): os.startfile(path)
+                self.root.after(0, lambda: messagebox.showerror("Error", f"导出失败: {e}"))
+        
+        threading.Thread(target=task, daemon=True).start()
 
 def main():
     p = argparse.ArgumentParser()
